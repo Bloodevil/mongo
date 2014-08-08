@@ -43,12 +43,10 @@ namespace mongo {
 
         StorageGlobalParams() :
             engine("mmapv1"),
-#ifdef _WIN32
-            dbpath("\\data\\db\\"),
-#else
-            dbpath("/data/db/"),
-#endif
+            dbpath(kDefaultDbPath),
             directoryperdb(false),
+            upgrade(false),
+            repair(false),
             lenForNewNsFiles(16 * 1024 * 1024),
             preallocj(true),
             journalCommitInterval(0), // 0 means use default
@@ -69,7 +67,12 @@ namespace mongo {
 
         std::string engine;
         std::string dbpath;
+        static const char* kDefaultDbPath;
+        static const char* kDefaultConfigDbPath;
+
         bool directoryperdb;
+        bool upgrade;
+        bool repair;
         std::string repairpath;
         unsigned lenForNewNsFiles;
 

@@ -47,6 +47,9 @@ namespace mongo {
     PlanStage::StageState ShardFilterStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         // If we've returned as many results as we're limited to, isEOF will be true.
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -81,19 +84,25 @@ namespace mongo {
         }
     }
 
-    void ShardFilterStage::prepareToYield() {
+    void ShardFilterStage::saveState() {
         ++_commonStats.yields;
-        _child->prepareToYield();
+        _child->saveState();
     }
 
-    void ShardFilterStage::recoverFromYield() {
+    void ShardFilterStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
-        _child->recoverFromYield();
+        _child->restoreState(opCtx);
     }
 
     void ShardFilterStage::invalidate(const DiskLoc& dl, InvalidationType type) {
         ++_commonStats.invalidates;
         _child->invalidate(dl, type);
+    }
+
+    vector<PlanStage*> ShardFilterStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
     }
 
     PlanStageStats* ShardFilterStage::getStats() {
@@ -102,6 +111,14 @@ namespace mongo {
         ret->children.push_back(_child->getStats());
         ret->specific.reset(new ShardingFilterStats(_specificStats));
         return ret.release();
+    }
+
+    const CommonStats* ShardFilterStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* ShardFilterStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

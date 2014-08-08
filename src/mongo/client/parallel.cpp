@@ -28,7 +28,7 @@
  */
 
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/client/parallel.h"
 
@@ -42,8 +42,11 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/version_manager.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kNetworking);
 
     LabeledLevel pc( "pcursor", 2 );
 
@@ -123,7 +126,7 @@ namespace mongo {
         double numExplains = 0;
 
         map<string,long long> counters;
-        
+
         map<string,list<BSONObj> > out;
         {
             _explain( out );
@@ -135,6 +138,17 @@ namespace mongo {
                 BSONArrayBuilder y( x.subarrayStart( shard ) );
                 for ( list<BSONObj>::iterator j=l.begin(); j!=l.end(); ++j ) {
                     BSONObj temp = *j;
+
+                    // If appending the next output from the shard is going to make the BSON
+                    // too large, then don't add it. We make sure the BSON doesn't get bigger
+                    // than the allowable "user size" for a BSONObj. This leaves a little bit
+                    // of extra space which mongos can use to add extra data.
+                    if ((x.len() + temp.objsize()) > BSONObjMaxUserSize) {
+                        y.append(BSON("warning" <<
+                            "shard output omitted due to nearing 16 MB limit"));
+                        break;
+                    }
+
                     y.append( temp );
 
                     BSONObjIterator k( temp );
@@ -235,7 +249,6 @@ namespace mongo {
 
         BSONObj ret = _next;
         _next = BSONObj();
-        _advance();
         return ret;
     }
 

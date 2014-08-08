@@ -63,7 +63,7 @@ namespace mongo {
         const BSONObj inclusiveLower(taskDetails.min);
         const BSONObj exclusiveUpper(taskDetails.max);
         const BSONObj keyPattern(taskDetails.shardKeyPattern);
-        const bool secondaryThrottle(taskDetails.secondaryThrottle);
+        const WriteConcernOptions writeConcern(taskDetails.writeConcern);
 
         const bool initiallyHaveClient = haveClient();
 
@@ -92,7 +92,7 @@ namespace mongo {
                                                       exclusiveUpper,
                                                       keyPattern),
                                              false, /*maxInclusive*/
-                                             repl::replSet ? secondaryThrottle : false,
+                                             writeConcern,
                                              serverGlobalParams.moveParanoia ? &removeSaver : NULL,
                                              true, /*fromMigrate*/
                                              true); /*onlyRemoveOrphans*/

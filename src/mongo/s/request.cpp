@@ -28,7 +28,7 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/request.h"
 
@@ -44,13 +44,15 @@
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/server.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     Request::Request( Message& m, AbstractMessagingPort* p ) :
         _m(m) , _d( m ) , _p(p) , _didInit(false) {
 
-        verify( _d.getns() );
         _id = _m.header()->id;
 
         _txn.reset(new OperationContextNoop());
@@ -74,16 +76,16 @@ namespace mongo {
 
     // Deprecated, will move to the strategy itself
     void Request::reset() {
-        if ( _m.operation() == dbKillCursors ) {
+        _m.header()->id = _id;
+        _clientInfo->clearRequestInfo();
+
+        if ( !_d.messageShouldHaveNs()) {
             return;
         }
 
         uassert( 13644 , "can't use 'local' database through mongos" , ! str::startsWith( getns() , "local." ) );
 
         grid.getDBConfig( getns() );
-
-        _m.header()->id = _id;
-        _clientInfo->clearRequestInfo();
     }
 
     void Request::process( int attempt ) {

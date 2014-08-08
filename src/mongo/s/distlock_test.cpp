@@ -27,7 +27,7 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/s/distlock.h"
 
@@ -36,13 +36,14 @@
 #include <vector>
 
 #include "mongo/base/init.h"
-#include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/bson_util.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 // Modify some config options for the RNG, since they cause MSVC to fail
@@ -72,6 +73,8 @@
 
 namespace mongo {
 
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
+
     class TestDistLockWithSync: public Command {
     public:
         TestDistLockWithSync() :
@@ -97,10 +100,9 @@ namespace mongo {
             while (keepGoing) {
                 try {
                     if (current->lock_try( "test" )) {
-                        count++;
-                        int before = count;
+                        int before = count.addAndFetch(1);
                         sleepmillis(3);
-                        int after = count;
+                        int after = count.loadRelaxed();
 
                         if (after != before) {
                             error() << " before: " << before << " after: " << after
@@ -122,7 +124,7 @@ namespace mongo {
             DistributedLock lk(ConnectionString(cmdObj["host"].String(),
                                                 ConnectionString::SYNC), "testdistlockwithsync", 0, 0);
             current = &lk;
-            count = 0;
+            count.store(0);
             gotit = 0;
             errors = 0;
             keepGoing = true;
@@ -144,7 +146,7 @@ namespace mongo {
 
             current = 0;
 
-            result.append("count", count);
+            result.append("count", count.loadRelaxed());
             result.append("gotit", gotit);
             result.append("errors", errors);
             result.append("timeMS", t.millis());
@@ -156,7 +158,7 @@ namespace mongo {
         static DistributedLock * current;
         static int gotit;
         static int errors;
-        static AtomicUInt count;
+        static AtomicUInt32 count;
 
         static bool keepGoing;
 
@@ -170,7 +172,7 @@ namespace mongo {
     }
 
     DistributedLock * TestDistLockWithSync::current;
-    AtomicUInt TestDistLockWithSync::count;
+    AtomicUInt32 TestDistLockWithSync::count;
     int TestDistLockWithSync::gotit;
     int TestDistLockWithSync::errors;
     bool TestDistLockWithSync::keepGoing;
@@ -271,23 +273,22 @@ namespace mongo {
 
                         log() << "**** Locked for thread " << threadId << " with ts " << lockObj["ts"] << endl;
 
-                        if( count % 2 == 1 && ! myLock->lock_try( "Testing lock re-entry.", true ) ) {
+                        if( count.loadRelaxed() % 2 == 1 && ! myLock->lock_try( "Testing lock re-entry.", true ) ) {
                             errors = true;
                             log() << "**** !Could not re-enter lock already held" << endl;
                             break;
                         }
 
-                        if( count % 3 == 1 && myLock->lock_try( "Testing lock non-re-entry.", false ) ) {
+                        if( count.loadRelaxed() % 3 == 1 && myLock->lock_try( "Testing lock non-re-entry.", false ) ) {
                             errors = true;
                             log() << "**** !Invalid lock re-entry" << endl;
                             break;
                         }
 
-                        count++;
-                        int before = count;
+                        int before = count.addAndFetch(1);
                         int sleep = randomWait();
                         sleepmillis(sleep);
-                        int after = count;
+                        int after = count.loadRelaxed();
 
                         if(after != before) {
                             errors = true;
@@ -360,7 +361,7 @@ namespace mongo {
                 return false;
             }
 
-            count = 0;
+            count.store(0);
             keepGoing = true;
 
             vector<shared_ptr<boost::thread> > threads;
@@ -382,7 +383,7 @@ namespace mongo {
                 errors = errors || results[i].get()->obj()["errors"].Bool();
             }
 
-            result.append("count", count);
+            result.append("count", count.loadRelaxed());
             result.append("errors", errors);
             result.append("timeMS", t.millis());
 
@@ -437,7 +438,7 @@ namespace mongo {
 
         // variables for test
         thread_specific_ptr<DistributedLock> lock;
-        AtomicUInt count;
+        AtomicUInt32 count;
         bool keepGoing;
 
     };

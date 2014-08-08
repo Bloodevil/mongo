@@ -48,16 +48,9 @@ namespace mongo {
 namespace repl {
 
     struct FixUpInfo;
+    class OplogReader;
     class ReplSetSeedList;
     class ReplSetHealthPollTask;
-
-    class ReplicationStartSynchronizer {
-    public:
-        ReplicationStartSynchronizer() : indexRebuildDone(false) {}
-        boost::mutex mtx;
-        bool indexRebuildDone;
-        boost::condition cond;
-    };
 
     // information about the entire replset, such as the various servers in the set, and their state
     /* note: We currently do not free mem when the set goes away - it is assumed the replset is a
@@ -73,7 +66,6 @@ namespace repl {
         static StartupStatus startupStatus;
         static DiagStr startupStatusMsg;
         static string stateAsHtml(MemberState state);
-        static ReplicationStartSynchronizer rss;
 
         /* todo thread */
         void msgUpdateHBInfo(HeartbeatInfo);
@@ -82,6 +74,14 @@ namespace repl {
          * Updates the lastHeartbeatRecv of Member with the given id.
          */
         void msgUpdateHBRecv(unsigned id, time_t newTime);
+
+        void electCmdReceived(const StringData& set,
+                              unsigned whoid,
+                              int cfgver,
+                              const OID& round,
+                              BSONObjBuilder* result) {
+            elect.electCmdReceived(set, whoid, cfgver, round, result);
+        }
 
         StateBox box;
 
@@ -93,7 +93,7 @@ namespace repl {
         // hash we use to make sure we are reading the right flow of ops and aren't on
         // an out-of-date "fork"
         long long lastH; 
-        bool forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result);
+        Status forceSyncFrom(const string& host, BSONObjBuilder* result);
         // Check if the current sync target is suboptimal. This must be called while holding a mutex
         // that prevents the sync source from changing.
         bool shouldChangeSyncTarget(const OpTime& target) const;
@@ -104,7 +104,7 @@ namespace repl {
         const Member* getMemberToSyncTo();
         void veto(const string& host, unsigned secs=10);
         bool gotForceSync();
-        void goStale(const Member* m, const BSONObj& o);
+        void goStale(OperationContext* txn, const Member* m, const BSONObj& o);
 
         OID getElectionId() const { return elect.getElectionId(); }
         OpTime getElectionTime() const { return elect.getElectionTime(); }
@@ -114,14 +114,14 @@ namespace repl {
         void startHealthTaskFor(Member *m);
 
         Consensus elect;
-        void relinquish();
-        void forgetPrimary();
+        void relinquish(OperationContext* txn);
+        void forgetPrimary(OperationContext* txn);
     protected:
-        bool _stepDown(int secs);
+        bool _stepDown(OperationContext* txn, int secs);
         bool _freeze(int secs);
     private:
         void _assumePrimary();
-        void loadLastOpTimeWritten(bool quiet=false);
+        void loadLastOpTimeWritten(OperationContext* txn, bool quiet = false);
         void changeState(MemberState s);
 
         Member* _forceSyncTarget;
@@ -191,7 +191,7 @@ namespace repl {
          *  - intentionally leaks the old _cfg and any old _members (if the
          *    change isn't strictly additive)
          */
-        bool initFromConfig(ReplSetConfig& c, bool reconf=false); 
+        bool initFromConfig(OperationContext* txn, ReplSetConfig& c, bool reconf = false);
         void _fillIsMaster(BSONObjBuilder&);
         void _fillIsMasterHost(const Member*, vector<string>&, vector<string>&, vector<string>&);
         const ReplSetConfig& config() { return *_cfg; }
@@ -215,13 +215,13 @@ namespace repl {
          * Finds the configuration with the highest version number and attempts
          * load it.
          */
-        bool _loadConfigFinish(vector<ReplSetConfig*>& v);
+        bool _loadConfigFinish(OperationContext* txn, vector<ReplSetConfig*>& v);
         /**
          * Gather all possible configs (from command line seeds, our own config
          * doc, and any hosts listed therein) and try to initiate from the most
          * recent config we find.
          */
-        void loadConfig();
+        void loadConfig(OperationContext* txn);
 
         list<HostAndPort> memberHostnames() const;
         bool iAmArbiterOnly() const { return myConfig().arbiterOnly; }
@@ -236,7 +236,7 @@ namespace repl {
 
         ReplSetImpl();
         /* throws exception if a problem initializing. */
-        void init(ReplSetSeedList&);
+        void init(OperationContext* txn, ReplSetSeedList&);
 
         void setSelfTo(Member *); // use this as it sets buildIndexes var
     private:
@@ -255,10 +255,8 @@ namespace repl {
          * call this and it will leave maintenance mode once all of the callers
          * have called it again, passing in false.
          */
-        bool setMaintenanceMode(const bool inc);
+        bool setMaintenanceMode(OperationContext* txn, const bool inc);
 
-        // Records a new slave's id in the GhostSlave map, at handshake time.
-        bool registerSlave(const BSONObj& rid, const int memberId);
     private:
         Member* head() const { return _members.head(); }
     public:
@@ -269,13 +267,12 @@ namespace repl {
         /**
          * Cause the node to resync from scratch.
          */
-        bool resync(std::string& errmsg);
+        bool resync(OperationContext* txn, std::string& errmsg);
     private:
         void _getTargets(list<Target>&, int &configVersion);
         void getTargets(list<Target>&, int &configVersion);
         void startThreads();
-        friend class FeedbackThread;
-        friend class CmdReplSetElect;
+        friend class LegacyReplicationCoordinator;
         friend class Member;
         friend class Manager;
         friend class Consensus;
@@ -283,7 +280,7 @@ namespace repl {
     private:
         bool _syncDoInitialSync_clone(OperationContext* txn, Cloner &cloner, const char *master,
                                       const list<string>& dbs, bool dataPass);
-        bool _syncDoInitialSync_applyToHead( SyncTail& syncer, OplogReader* r ,
+        bool _syncDoInitialSync_applyToHead( OperationContext* txn, SyncTail& syncer, OplogReader* r ,
                                              const Member* source, const BSONObj& lastOp,
                                              BSONObj& minValidOut);
         void _syncDoInitialSync();
@@ -320,7 +317,7 @@ namespace repl {
 
         const ReplSetConfig::MemberCfg& myConfig() const { return _config; }
         bool tryToGoLiveAsASecondary(OperationContext* txn, OpTime&); // readlocks
-        void syncRollback(OplogReader& r);
+        void syncRollback(OperationContext* txn, OplogReader& r);
         void syncThread();
         const OpTime lastOtherOpTime() const;
         /**
@@ -337,17 +334,19 @@ namespace repl {
          * minValid, to indicate that we are in a consistent state when the batch has been fully 
          * applied.
          */
-        static void setMinValid(BSONObj obj);
-        static OpTime getMinValid();
-        static void clearInitialSyncFlag();
+        static void setMinValid(OperationContext* txn, BSONObj obj);
+        static OpTime getMinValid(OperationContext* txn);
+        static void clearInitialSyncFlag(OperationContext* txn);
         static bool getInitialSyncFlag();
-        static void setInitialSyncFlag();
+        static void setInitialSyncFlag(OperationContext* txn);
 
         int oplogVersion;
 
         // bool for indicating resync need on this node and the mutex that protects it
         bool initialSyncRequested;
         boost::mutex initialSyncMutex;
+
+        BSONObj getLastErrorDefault;
     private:
         IndexPrefetchConfig _indexPrefetchConfig;
 

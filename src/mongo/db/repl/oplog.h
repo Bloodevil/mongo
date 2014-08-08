@@ -28,6 +28,9 @@
 
 #pragma once
 
+#include <cstddef>
+#include <string>
+
 namespace mongo {
     class BSONObj;
     class Database;
@@ -39,17 +42,16 @@ namespace repl {
     // These functions redefine the function for logOp(),
     // for either master/slave or replica sets.
     void oldRepl();  // master-slave
-    void newRepl();  // replica set starting up 
     void newReplUp();// replica set after startup
 
     // Create a new capped collection for the oplog if it doesn't yet exist.
     // This will be either local.oplog.rs (replica sets) or local.oplog.$main (master/slave)
     // If the collection already exists, set the 'last' OpTime if master/slave (side effect!)
-    void createOplog();
+    void createOplog(OperationContext* txn);
 
     // This poorly-named function writes an op into the replica-set oplog;
     // used internally by replication secondaries after they have applied an op
-    void _logOpObjRS(const BSONObj& op);
+    void _logOpObjRS(OperationContext* txn, const BSONObj& op);
 
     const char rsoplog[] = "local.oplog.rs";
 
@@ -107,10 +109,9 @@ namespace repl {
                                bool convertUpdateToUpsert = false);
 
     /**
-     * Waits until the given timeout for the OpTime from the oplog to change.
-     * Returns true if the OpTime changed occured before the timeout.
+     * Waits one second for the OpTime from the oplog to change.
      */
-    bool waitForOptimeChange(const OpTime& referenceTime, unsigned timeoutMillis);
+    void waitUpToOneSecondForOptimeChange(const OpTime& referenceTime);
 
     /**
      * Initializes the global OpTime with the value from the timestamp of the last oplog entry.

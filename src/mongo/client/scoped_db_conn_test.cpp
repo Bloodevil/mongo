@@ -28,6 +28,7 @@
 #include "mongo/base/init.h"
 #include "mongo/client/connpool.h"
 #include "mongo/platform/cstdint.h"
+#include "mongo/util/net/listen.h"
 #include "mongo/util/net/message_port.h"
 #include "mongo/util/net/message_server.h"
 #include "mongo/util/fail_point_service.h"
@@ -62,6 +63,9 @@ namespace {
 }
 
 namespace mongo {
+
+    class OperationContext;
+
     // Symbols defined to build the binary correctly.
 
     bool inShutdown() {
@@ -69,7 +73,7 @@ namespace mongo {
         return shuttingDown;
     }
 
-    DBClientBase *createDirectClient() { return NULL; }
+    DBClientBase* createDirectClient(OperationContext* txn) { return NULL; }
 
     void dbexit(ExitCode rc, const char *why){
         {

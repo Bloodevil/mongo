@@ -41,6 +41,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/scripting/v8_deadline_monitor.h"
 #include "mongo/scripting/v8-3.25_profiler.h"
+#include "mongo/util/log.h"
 
 /**
  * V8_SIMPLE_HEADER must be placed in any function called from a public API
@@ -92,6 +93,8 @@ namespace mongo {
          * V8Scope is destructed.
          */
         ~ObjTracker() {
+            MONGO_LOG_DEFAULT_COMPONENT_LOCAL(::mongo::logger::LogComponent::kQuery);
+
             if (!_container.empty()) {
                 LOG(1) << "freeing " << _container.size() << " uncollected "
                        << typeid(_ObjType).name() << " objects" << endl;
@@ -169,12 +172,18 @@ namespace mongo {
 
         /** check if there is a pending killOp request */
         bool isKillPending() const;
+        
+        /**
+         * Obtains the operation context associated with this Scope, so it can be given to the
+         * DBDirectClient used by the V8 engine's connection. Only needed for dbEval.
+         */
+        OperationContext* getOpContext() const;
 
         /**
          * Connect to a local database, create a Mongo object instance, and load any
          * server-side js into the global object
          */
-        virtual void localConnect(const char* dbName);
+        virtual void localConnectForDbEval(OperationContext* txn, const char* dbName);
 
         virtual void externalSetup();
 
@@ -513,6 +522,7 @@ namespace mongo {
         bool _inNativeExecution;     // protected by _interruptLock
         bool _pendingKill;           // protected by _interruptLock
         int _opId;                   // op id for this scope
+        OperationContext* _opCtx;    // Op context for DbEval
     };
 
     /// Helper to extract V8Scope for an Isolate

@@ -26,26 +26,28 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
-
 #include <boost/thread/thread.hpp>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/heartbeat_info.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/repl_set_health_poll_task.h"
-#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/repl_set_heartbeat_args.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/server.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/task.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/goodies.h"
-#include "mongo/util/mongoutils/html.h"
 #include "mongo/util/ramlog.h"
 
 namespace mongo {
@@ -53,7 +55,33 @@ namespace repl {
 
     MONGO_FP_DECLARE(rsDelayHeartbeatResponse);
 
-    using namespace bson;
+namespace {
+    /**
+     * Returns true if there is no data on this server. Useful when starting replication.
+     * The "local" database does NOT count except for "rs.oplog" collection.
+     * Used to set the hasData field on replset heartbeat command response.
+     */
+    bool replHasDatabases(OperationContext* txn) {
+        vector<string> names;
+        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        storageEngine->listDatabases(&names);
+
+        if( names.size() >= 2 ) return true;
+        if( names.size() == 1 ) {
+            if( names[0] != "local" )
+                return true;
+            // we have a local database.  return true if oplog isn't empty
+            {
+                Lock::DBRead lk(txn->lockState(), repl::rsoplog);
+                BSONObj o;
+                if( Helpers::getFirst(txn, repl::rsoplog, o) )
+                    return true;
+            }
+        }
+        return false;
+    }
+    
+} // namespace
 
     /* { replSetHeartbeat : <setname> } */
     class CmdReplSetHeartbeat : public ReplSetCommand {
@@ -76,7 +104,7 @@ namespace repl {
 
             /* we don't call ReplSetCommand::check() here because heartbeat
                checks many things that are pre-initialization. */
-            if( !replSet ) {
+            if (!getGlobalReplicationCoordinator()->getSettings().usingReplSets()) {
                 errmsg = "not running with --replSet";
                 return false;
             }
@@ -94,13 +122,21 @@ namespace repl {
                     mp->tag |= ScopedConn::keepOpen;
             }
 
+            ReplSetHeartbeatArgs args;
+            Status status = args.initialize(cmdObj);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
             // ugh.
-            if( cmdObj["checkEmpty"].trueValue() ) {
+            if (args.getCheckEmpty()) {
                 result.append("hasData", replHasDatabases(txn));
             }
 
-            Status status = getGlobalReplicationCoordinator()->processHeartbeat(cmdObj, 
-                                                                                &result);
+            ReplSetHeartbeatResponse response;
+            status = getGlobalReplicationCoordinator()->processHeartbeat(args, &response);
+            if (status.isOK())
+                response.addToBSON(&result);
             return appendCommandStatus(result, status);
         }
     } cmdReplSetHeartbeat;
@@ -182,7 +218,8 @@ namespace repl {
         boost::thread t(startSyncThread);
 
         boost::thread producer(stdx::bind(&BackgroundSync::producerThread, sync));
-        theReplSet->syncSourceFeedback.go();
+        boost::thread feedback(stdx::bind(&SyncSourceFeedback::run,
+                                          &theReplSet->syncSourceFeedback));
 
         // member heartbeats are started in ReplSetImpl::initFromConfig
     }

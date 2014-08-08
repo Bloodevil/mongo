@@ -62,8 +62,7 @@
 
 namespace mongo {
 
-    using namespace mongoutils::html;
-    using namespace bson;
+    using namespace html;
 
     struct Timing {
         Timing() {

@@ -67,6 +67,9 @@ namespace mongo {
     PlanStage::StageState MergeSortStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         if (!_noResultToMerge.empty()) {
@@ -179,17 +182,17 @@ namespace mongo {
         return PlanStage::ADVANCED;
     }
 
-    void MergeSortStage::prepareToYield() {
+    void MergeSortStage::saveState() {
         ++_commonStats.yields;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->prepareToYield();
+            _children[i]->saveState();
         }
     }
 
-    void MergeSortStage::recoverFromYield() {
+    void MergeSortStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->recoverFromYield();
+            _children[i]->restoreState(opCtx);
         }
     }
 
@@ -246,6 +249,10 @@ namespace mongo {
         return false;
     }
 
+    vector<PlanStage*> MergeSortStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* MergeSortStage::getStats() {
         _commonStats.isEOF = isEOF();
 
@@ -257,6 +264,14 @@ namespace mongo {
             ret->children.push_back(_children[i]->getStats());
         }
         return ret.release();
+    }
+
+    const CommonStats* MergeSortStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* MergeSortStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

@@ -45,6 +45,7 @@ namespace mongo {
      *
      * Preconditions: Valid DiskLoc.
      *
+     * Owns the query solutions and PlanStage roots for all candidate plans.
      */
     class MultiPlanStage : public PlanStage {
     public:
@@ -53,24 +54,29 @@ namespace mongo {
 
         virtual ~MultiPlanStage();
 
-        /**
-         * Helper used by the destructor to delete losing candidate plans.
-         */
-        void clearCandidates();
-
         virtual bool isEOF();
 
         virtual StageState work(WorkingSetID* out);
 
-        virtual void prepareToYield();
+        virtual void saveState();
 
-        virtual void recoverFromYield();
+        virtual void restoreState(OperationContext* opCtx);
 
         virtual void invalidate(const DiskLoc& dl, InvalidationType type);
 
+        virtual std::vector<PlanStage*> getChildren() const;
+
+        virtual StageType stageType() const { return STAGE_MULTI_PLAN; }
+
         virtual PlanStageStats* getStats();
 
-        /** Takes ownership of QuerySolution and PlanStage. not of WorkingSet */
+        virtual const CommonStats* getCommonStats();
+
+        virtual const SpecificStats* getSpecificStats();
+
+        /**
+         * Takes ownership of QuerySolution and PlanStage. not of WorkingSet
+         */
         void addPlan(QuerySolution* solution, PlanStage* root, WorkingSet* sharedWs);
 
         /**
@@ -79,13 +85,18 @@ namespace mongo {
          */
         void pickBestPlan();
 
-	/** Return true if a best plan has been chosen  */
+        /** Return true if a best plan has been chosen  */
         bool bestPlanChosen() const;
 
         /** Return the index of the best plan chosen, for testing */
         int bestPlanIdx() const;
 
-        /** Returns the QuerySolution for the best plan, or NULL if no best plan */
+        /**
+         * Returns the QuerySolution for the best plan, or NULL if no best plan
+         *
+         * The MultiPlanStage retains ownership of the winning QuerySolution and returns an
+         * unowned pointer.
+         */
         QuerySolution* bestSolution();
 
         /**
@@ -95,29 +106,20 @@ namespace mongo {
          */
         bool hasBackupPlan() const;
 
-        /**
-         * Gathers execution stats for all losing plans.
-         */
-        vector<PlanStageStats*>* generateCandidateStats();
-
         //
         // Used by explain.
         //
 
         /**
-         * Runs the winning plan into it hits EOF or returns DEAD, throwing out the results.
-         * Execution stats are gathered in the process.
-         *
-         * You can call this after calling pickBestPlan(...). It expects that a winning plan
-         * has already been selected.
+         * Gathers execution stats for all losing plans.
          */
-        Status executeWinningPlan();
+        vector<PlanStageStats*> generateCandidateStats();
 
         /**
          * Runs the candidate plans until each has either hit EOF or returned DEAD. Results
          * from the plans are thrown out, but execution stats are gathered.
          *
-         * You can call this after calling pickBestPlan(...). It expects that a winning plan
+         * You should call this after calling pickBestPlan(...). It expects that a winning plan
          * has already been selected.
          */
         Status executeAllPlans();
@@ -141,7 +143,7 @@ namespace mongo {
 
         void allPlansSaveState();
 
-        void allPlansRestoreState();
+        void allPlansRestoreState(OperationContext* opCtx);
 
         static const int kNoSuchPlan = -1;
 
@@ -152,7 +154,9 @@ namespace mongo {
         // not owned here
         CanonicalQuery* _query;
 
-        // Candidate plans.  Owned here.
+        // Candidate plans. Each candidate includes a child PlanStage tree and QuerySolution which
+        // are owned here. Ownership of all QuerySolutions is retained here, and will *not* be
+        // tranferred to the PlanExecutor that wraps this stage.
         std::vector<CandidatePlan> _candidates;
 
         // Candidate plans' stats. Owned here.

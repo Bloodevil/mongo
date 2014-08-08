@@ -26,7 +26,12 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
+
+#include <algorithm>
+#include <string>
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
@@ -36,97 +41,106 @@
 
 namespace mongo {
 
-    DurRecoveryUnit::DurRecoveryUnit(OperationContext* txn)
-        : _txn(txn) {
 
-        _hasWrittenSinceCheckpoint = false;
-    }
+    /**
+     *  A MemoryWrite provides rollback by keeping a pre-image.
+     */
+    class MemoryWrite : public RecoveryUnit::Change {
+    public:
+        MemoryWrite(char* base, size_t len) : _base(base), _preimage(base, len) { }
+        virtual void commit();
+        virtual void rollback();
+
+    private:
+        char* _base;
+        std::string _preimage;  // TODO consider storing out-of-line
+    };
+
+    DurRecoveryUnit::DurRecoveryUnit(OperationContext* txn)
+        : _txn(txn),
+          _state(NORMAL)
+    {}
 
     void DurRecoveryUnit::beginUnitOfWork() {
 #if ROLLBACK_ENABLED
-        _nestingLevel++;
+        _startOfUncommittedChangesForLevel.push_back(_changes.size());
 #endif
     }
 
     void DurRecoveryUnit::commitUnitOfWork() {
 #if ROLLBACK_ENABLED
-        invariant(_state != MUST_ROLLBACK);
-        invariant(_nestingLevel > 0);
+        invariant(inAUnitOfWork());
 
-        if (_nestingLevel != 1) {
-            // If we are nested, punt to outer UnitOfWork. These changes will only be pushed to the
-            // global damages list when the outer UnitOfWork commits (which it must now do).
-            if (haveUncommitedChanges())
+        if (!inOutermostUnitOfWork()) {
+            // If we are nested, make all changes for this level part of the containing UnitOfWork.
+            // They will be added to the global damages list once the outermost UnitOfWork commits,
+            // which it must now do.
+            if (haveUncommitedChangesAtCurrentLevel()) {
+                _startOfUncommittedChangesForLevel.back() = _changes.size();
                 _state = MUST_COMMIT;
+            }
             return;
         }
 
         publishChanges();
 #endif
 
-        // global journal flush
+        // global journal flush opportunity
         getDur().commitIfNeeded(_txn);
     }
 
     void DurRecoveryUnit::endUnitOfWork() {
 #if ROLLBACK_ENABLED
-        invariant(_nestingLevel > 0);
+        invariant(inAUnitOfWork());
 
-        if (--_nestingLevel != 0) {
-            // If we are nested, punt to outer UnitOfWork. These changes will only be rolled back
-            // when the outer UnitOfWork rolls back (which it must now do).
-            if (haveUncommitedChanges()) {
-                invariant(_state != MUST_COMMIT);
-                _state = MUST_ROLLBACK;
-            }
-            return;
+        if (haveUncommitedChangesAtCurrentLevel()) {
+            invariant(_state != MUST_COMMIT);
+            rollbackInnermostChanges();
         }
 
-        rollbackChanges();
+        // If outermost, we return to "normal" state after rolling back.
+        if (inOutermostUnitOfWork())
+            _state = NORMAL;
+
+        _startOfUncommittedChangesForLevel.pop_back();
 #endif
     }
 
     void DurRecoveryUnit::publishChanges() {
-        invariant(_state != MUST_ROLLBACK);
-
-        if (getDur().isDurable()) {
-            for (Changes::iterator it=_changes.begin(), end=_changes.end(); it != end; ++it) {
-                // TODO don't go through getDur() interface.
-                getDur().writingPtr(it->base, it->preimage.size());
-            }
+        for (Changes::iterator it = _changes.begin(), end = _changes.end(); it != end; ++it) {
+            (*it)->commit();
         }
 
-        reset();
+        // We now reset to a "clean" state without any uncommited changes, while keeping the same
+        // nesting level. Eventually this should only be called from the outermost UnitOfWork.
+        _state = NORMAL;
+        _changes.clear();
+        std::fill(_startOfUncommittedChangesForLevel.begin(),
+                  _startOfUncommittedChangesForLevel.end(),
+                  0);
     }
 
-    void DurRecoveryUnit::rollbackChanges() {
+    void DurRecoveryUnit::rollbackInnermostChanges() {
         invariant(_state != MUST_COMMIT);
 
-        for (Changes::reverse_iterator it=_changes.rbegin(), end=_changes.rend(); it != end; ++it) {
-            // TODO need to add these pages to our "dirty count" somehow.
-            it->preimage.copy(it->base, it->preimage.size());
+        invariant(_changes.size() <= size_t(std::numeric_limits<int>::max()));
+        const int rollbackTo = _startOfUncommittedChangesForLevel.back();
+        for (int i = _changes.size() - 1; i >= rollbackTo; i--) {
+            _changes[i]->rollback();
         }
-
-        reset();
+        _changes.erase(_changes.begin() + rollbackTo, _changes.end());
     }
 
     void DurRecoveryUnit::recordPreimage(char* data, size_t len) {
         invariant(len > 0);
 
-        Change change;
-        change.base = data;
-        change.preimage.assign(data, len);
-        _changes.push_back(change);
-    }
-
-    void DurRecoveryUnit::reset() {
-        _state = NORMAL;
-        _changes.clear();
+        registerChange(new MemoryWrite(data, len));
     }
 
     bool DurRecoveryUnit::awaitCommit() {
 #if ROLLBACK_ENABLED
-        invariant(_state != MUST_ROLLBACK);
+        // TODO this is currently only called outside of WriteLocks and UnitsOfWork.
+        // Consider enforcing with an invariant rather than correctly handling uncommitted changes.
         publishChanges();
         _state = NORMAL;
 #endif
@@ -134,11 +148,10 @@ namespace mongo {
     }
 
     bool DurRecoveryUnit::commitIfNeeded(bool force) {
+        // TODO see if we can ban this inside of nested UnitsOfWork.
 #if ROLLBACK_ENABLED
-        invariant(_state != MUST_ROLLBACK);
         publishChanges();
 #endif
-        _hasWrittenSinceCheckpoint = false;
         return getDur().commitIfNeeded(_txn, force);
     }
 
@@ -147,26 +160,46 @@ namespace mongo {
     }
 
     void* DurRecoveryUnit::writingPtr(void* data, size_t len) {
+        invariant(len > 0);
 #if ROLLBACK_ENABLED
-        invariant(_nestingLevel >= 1);
-        invariant(_state != MUST_ROLLBACK);
-        recordPreimage(static_cast<char*>(data), len);
-        _hasWrittenSinceCheckpoint = true;
+        invariant(inAUnitOfWork());
+        // TODO need to call MemoryMappedFile::makeWritable()
+        registerChange(new MemoryWrite(static_cast<char*>(data), len));
         return data;
 #else
         invariant(_txn->lockState()->isWriteLocked());
 
-        _hasWrittenSinceCheckpoint = true;
         return getDur().writingPtr(data, len);
+#endif
+    }
+
+    void DurRecoveryUnit::registerChange(Change* change) {
+#if ROLLBACK_ENABLED
+        invariant(inAUnitOfWork());
+        _changes.push_back(ChangePtr(change));
+#else
+        change->commit();
+        delete change;
 #endif
     }
 
     void DurRecoveryUnit::syncDataAndTruncateJournal() {
 #if ROLLBACK_ENABLED
-        invariant(_state != MUST_ROLLBACK);
         publishChanges();
 #endif
         return getDur().syncDataAndTruncateJournal(_txn);
+    }
+
+    void MemoryWrite::commit() {
+        // TODO don't go through getDur() interface.
+        if (getDur().isDurable()) {
+            getDur().writingPtr(_base, _preimage.size());
+        }
+    }
+
+    void MemoryWrite::rollback() {
+        // TODO need to add these pages to our "dirty count" somehow.
+       _preimage.copy(_base, _preimage.size());
     }
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,6 +35,7 @@
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
 #include "mongo/db/exec/collection_scan.h"
+#include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/limit.h"
@@ -78,6 +79,7 @@ namespace mongo {
      * node -> {skip: {args: {node: node, num: posint}}}
      * node -> {sort: {args: {node: node, pattern: objWithSortCriterion }}}
      * node -> {mergeSort: {args: {nodes: [node, node], pattern: objWithSortCriterion}}}
+     * node -> {delete: {args: {node: node, isMulti: bool, shouldCallLogOp: bool}}}
      *
      * Forthcoming Nodes:
      *
@@ -116,7 +118,10 @@ namespace mongo {
             string collName = collElt.String();
 
             // Need a context to get the actual Collection*
-            Client::ReadContext ctx(txn, dbname);
+            // TODO A write lock is currently taken here to accommodate stages that perform writes
+            //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
+            //      execution trees.
+            Client::WriteContext ctx(txn, dbname);
 
             // Make sure the collection is valid.
             Database* db = ctx.ctx().db();
@@ -134,7 +139,7 @@ namespace mongo {
             OwnedPointerVector<MatchExpression> exprs;
             auto_ptr<WorkingSet> ws(new WorkingSet());
 
-            PlanStage* userRoot = parseQuery(collection, planObj, ws.get(), &exprs);
+            PlanStage* userRoot = parseQuery(txn, collection, planObj, ws.get(), &exprs);
             uassert(16911, "Couldn't parse plan from " + cmdObj.toString(), NULL != userRoot);
 
             // Add a fetch at the top for the user so we can get obj back for sure.
@@ -145,7 +150,7 @@ namespace mongo {
 
             BSONArrayBuilder resultBuilder(result.subarrayStart("results"));
 
-            for (BSONObj obj; Runner::RUNNER_ADVANCED == runner.getNext(&obj, NULL); ) {
+            for (BSONObj obj; PlanExecutor::ADVANCED == runner.getNext(&obj, NULL); ) {
                 resultBuilder.append(obj);
             }
 
@@ -153,7 +158,8 @@ namespace mongo {
             return true;
         }
 
-        PlanStage* parseQuery(Collection* collection,
+        PlanStage* parseQuery(OperationContext* txn,
+                              Collection* collection,
                               BSONObj obj,
                               WorkingSet* workingSet,
                               OwnedPointerVector<MatchExpression>* exprs) {
@@ -176,7 +182,7 @@ namespace mongo {
                 BSONObj argObj = e.Obj();
                 if (filterTag == e.fieldName()) {
                     StatusWithMatchExpression swme = MatchExpressionParser::parse(
-                                        argObj, WhereCallbackReal(collection->ns().db()));
+                                        argObj, WhereCallbackReal(txn, collection->ns().db()));
                     if (!swme.isOK()) { return NULL; }
                     // exprs is what will wind up deleting this.
                     matcher = swme.getValue();
@@ -211,7 +217,7 @@ namespace mongo {
                 params.bounds.endKeyInclusive = nodeArgs["endKeyInclusive"].Bool();
                 params.direction = nodeArgs["direction"].numberInt();
 
-                return new IndexScan(params, workingSet, matcher);
+                return new IndexScan(txn, params, workingSet, matcher);
             }
             else if ("andHash" == nodeName) {
                 uassert(16921, "Nodes argument must be provided to AND",
@@ -226,7 +232,7 @@ namespace mongo {
                     uassert(16922, "node of AND isn't an obj?: " + e.toString(),
                             e.isABSONObj());
 
-                    PlanStage* subNode = parseQuery(collection, e.Obj(), workingSet, exprs);
+                    PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
                     uassert(16923, "Can't parse sub-node of AND: " + e.Obj().toString(),
                             NULL != subNode);
                     // takes ownership
@@ -252,7 +258,7 @@ namespace mongo {
                     uassert(16925, "node of AND isn't an obj?: " + e.toString(),
                             e.isABSONObj());
 
-                    PlanStage* subNode = parseQuery(collection, e.Obj(), workingSet, exprs);
+                    PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
                     uassert(16926, "Can't parse sub-node of AND: " + e.Obj().toString(),
                             NULL != subNode);
                     // takes ownership
@@ -275,7 +281,7 @@ namespace mongo {
                 while (it.more()) {
                     BSONElement e = it.next();
                     if (!e.isABSONObj()) { return NULL; }
-                    PlanStage* subNode = parseQuery(collection, e.Obj(), workingSet, exprs);
+                    PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
                     uassert(16936, "Can't parse sub-node of OR: " + e.Obj().toString(),
                             NULL != subNode);
                     // takes ownership
@@ -287,7 +293,8 @@ namespace mongo {
             else if ("fetch" == nodeName) {
                 uassert(16929, "Node argument must be provided to fetch",
                         nodeArgs["node"].isABSONObj());
-                PlanStage* subNode = parseQuery(collection,
+                PlanStage* subNode = parseQuery(txn,
+                                                collection,
                                                 nodeArgs["node"].Obj(),
                                                 workingSet,
                                                 exprs);
@@ -300,7 +307,8 @@ namespace mongo {
                         nodeArgs["node"].isABSONObj());
                 uassert(16931, "Num argument must be provided to limit",
                         nodeArgs["num"].isNumber());
-                PlanStage* subNode = parseQuery(collection,
+                PlanStage* subNode = parseQuery(txn,
+                                                collection,
                                                 nodeArgs["node"].Obj(),
                                                 workingSet,
                                                 exprs);
@@ -313,7 +321,8 @@ namespace mongo {
                         nodeArgs["node"].isABSONObj());
                 uassert(16933, "Num argument must be provided to skip",
                         nodeArgs["num"].isNumber());
-                PlanStage* subNode = parseQuery(collection,
+                PlanStage* subNode = parseQuery(txn,
+                                                collection,
                                                 nodeArgs["node"].Obj(),
                                                 workingSet,
                                                 exprs);
@@ -333,7 +342,7 @@ namespace mongo {
                     params.direction = CollectionScanParams::BACKWARD;
                 }
 
-                return new CollectionScan(params, workingSet, matcher);
+                return new CollectionScan(txn, params, workingSet, matcher);
             }
             // sort is disabled for now.
 #if 0
@@ -342,7 +351,7 @@ namespace mongo {
                         nodeArgs["node"].isABSONObj());
                 uassert(16970, "Pattern argument must be provided to sort",
                         nodeArgs["pattern"].isABSONObj());
-                PlanStage* subNode = parseQuery(db, nodeArgs["node"].Obj(), workingSet, exprs);
+                PlanStage* subNode = parseQuery(txn, db, nodeArgs["node"].Obj(), workingSet, exprs);
                 SortStageParams params;
                 params.pattern = nodeArgs["pattern"].Obj();
                 return new SortStage(params, workingSet, subNode);
@@ -367,7 +376,7 @@ namespace mongo {
                     uassert(16973, "node of mergeSort isn't an obj?: " + e.toString(),
                             e.isABSONObj());
 
-                    PlanStage* subNode = parseQuery(collection, e.Obj(), workingSet, exprs);
+                    PlanStage* subNode = parseQuery(txn, collection, e.Obj(), workingSet, exprs);
                     uassert(16974, "Can't parse sub-node of mergeSort: " + e.Obj().toString(),
                             NULL != subNode);
                     // takes ownership
@@ -403,7 +412,26 @@ namespace mongo {
                     return NULL;
                 }
 
-                return new TextStage(params, workingSet, matcher);
+                return new TextStage(txn, params, workingSet, matcher);
+            }
+            else if ("delete" == nodeName) {
+                uassert(18636, "Delete stage doesn't have a filter (put it on the child)",
+                        NULL == matcher);
+                uassert(18637, "node argument must be provided to delete",
+                        nodeArgs["node"].isABSONObj());
+                uassert(18638, "isMulti argument must be provided to delete",
+                        nodeArgs["isMulti"].type() == Bool);
+                uassert(18639, "shouldCallLogOp argument must be provided to delete",
+                        nodeArgs["shouldCallLogOp"].type() == Bool);
+                PlanStage* subNode = parseQuery(txn,
+                                                collection,
+                                                nodeArgs["node"].Obj(),
+                                                workingSet,
+                                                exprs);
+                DeleteStageParams params;
+                params.isMulti = nodeArgs["isMulti"].Bool();
+                params.shouldCallLogOp = nodeArgs["shouldCallLogOp"].Bool();
+                return new DeleteStage(txn, params, workingSet, collection, subNode);
             }
             else {
                 return NULL;

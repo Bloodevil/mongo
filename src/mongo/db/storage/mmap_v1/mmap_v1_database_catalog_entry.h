@@ -30,11 +30,14 @@
 
 #pragma once
 
+#include <map>
+#include <string>
+
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
-#include "mongo/db/structure/catalog/namespace_index.h"
 
 namespace mongo {
 
@@ -89,7 +92,7 @@ namespace mongo {
          * will return NULL if ns does not exist
          */
         CollectionCatalogEntry* getCollectionCatalogEntry( OperationContext* txn,
-                                                           const StringData& ns );
+                                                           const StringData& ns ) const;
 
         RecordStore* getRecordStore( OperationContext* txn,
                                      const StringData& ns );
@@ -98,15 +101,18 @@ namespace mongo {
                                      const CollectionCatalogEntry* collection,
                                      IndexCatalogEntry* index );
 
-        const MmapV1ExtentManager* getExtentManager() const { return &_extentManager; } // TODO(ERH): remove
-        MmapV1ExtentManager* getExtentManager() { return &_extentManager; } // TODO(ERH): remove
+        const MmapV1ExtentManager* getExtentManager() const { return &_extentManager; }
+        MmapV1ExtentManager* getExtentManager() { return &_extentManager; }
+
+        CollectionOptions getCollectionOptions( OperationContext* txn,
+                                                const StringData& ns ) const;
 
     private:
 
         RecordStoreV1Base* _getIndexRecordStore_inlock();
         RecordStoreV1Base* _getIndexRecordStore();
-        RecordStoreV1Base* _getNamespaceRecordStore_inlock();
-        RecordStoreV1Base* _getNamespaceRecordStore();
+        RecordStoreV1Base* _getNamespaceRecordStore_inlock() const;
+        RecordStoreV1Base* _getNamespaceRecordStore() const;
 
         RecordStoreV1Base* _getRecordStore( OperationContext* txn,
                                             const StringData& ns );
@@ -127,35 +133,43 @@ namespace mongo {
                                        const StringData& toNS,
                                        bool stayTemp );
 
-        void _removeFromCache( const StringData& ns );
-
-        /**
-         * @throws DatabaseDifferCaseCode if the name is a duplicate based on
-         * case insensitive matching.
-         */
-        void _checkDuplicateUncasedNames() const;
-
         void _ensureSystemCollection_inlock( OperationContext* txn,
                                              const StringData& ns );
         void _lazyInit( OperationContext* txn );
-
 
         std::string _path;
 
         MmapV1ExtentManager _extentManager;
         NamespaceIndex _namespaceIndex;
 
-        // this is all a cache, and not definitive
+        //  The _collections map is a cache for efficiently looking up namespace information.
+        //  Access to the cache is protected by the _collectionsLock mutex.
+        //  Once initialized, the cache must remain consistent with the data in the memory-mapped
+        //  database files through _removeFromCache and _insertInCache_inlock. These methods
+        //  use the RecoveryUnit to ensure correct handling of rollback.
+
         struct Entry {
             scoped_ptr<CollectionCatalogEntry> catalogEntry;
             scoped_ptr<RecordStoreV1Base> recordStore;
         };
 
-        void _fillInEntry_inlock( OperationContext* opCtx, const StringData& ns, Entry* entry );
+        /**
+         * Populate the _collections cache.
+         */
+        void _insertInCache_inlock(OperationContext* opCtx, const StringData& ns, Entry* entry);
 
-        boost::mutex _collectionsLock;
-        typedef std::map<std::string,Entry*> CollectionMap;
+        /**
+         * Drop cached information for specified namespace. If a RecoveryUnit is specified,
+         * use it to allow rollback. When ru is null, removal is unconditional.
+         */
+        void _removeFromCache(RecoveryUnit* ru, const StringData& ns);
+
+        mutable boost::mutex _collectionsLock;
+        typedef std::map<std::string, Entry*> CollectionMap;
         CollectionMap _collections;
+
+        class EntryInsertion;
+        class EntryRemoval;
 
         friend class NamespaceDetailsCollectionCatalogEntry;
     };

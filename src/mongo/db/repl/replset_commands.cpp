@@ -36,22 +36,13 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_settings.h"  // replSettings
 #include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs_config.h"
+#include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/write_concern.h"
-
-using namespace bson;
 
 namespace mongo {
 namespace repl {
-
-    void checkMembersUpForConfigChange(const ReplSetConfig& cfg, BSONObjBuilder& result, bool initial);
-
-    /* commands in other files:
-         replSetHeartbeat - health.cpp
-         replSetInitiate  - rs_mod.cpp
-    */
 
     bool replSetBlind = false;
     unsigned replSetForceInitialSyncFailure = 0;
@@ -75,8 +66,9 @@ namespace repl {
                 return true;
             }
 
-            if( !check(errmsg, result) )
-                return false;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
 
             if( cmdObj.hasElement("blind") ) {
                 replSetBlind = cmdObj.getBoolField("blind");
@@ -105,16 +97,10 @@ namespace repl {
     */
     class CmdReplSetGetRBID : public ReplSetCommand {
     public:
-        /* todo: ideally this should only change on rollbacks NOT on mongod restarts also. fix... */
-        int rbid;
         virtual void help( stringstream &help ) const {
             help << "internal";
         }
-        CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {
-            // this is ok but micros or combo with some rand() and/or 64 bits might be better --
-            // imagine a restart and a clock correction simultaneously (very unlikely but possible...)
-            rbid = (int) curTimeMillis64();
-        }
+        CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {}
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
@@ -123,17 +109,14 @@ namespace repl {
             out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if( !check(errmsg, result) )
-                return false;
-            result.append("rbid",rbid);
-            return true;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+
+            status = getGlobalReplicationCoordinator()->processReplSetGetRBID(&result);
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetRBID;
-
-    /** we increment the rollback id on every rollback event. */
-    void incRBID() {
-        cmdReplSetRBID.rbid++;
-    }
 
     /** helper to get rollback id from another server. */
     int getRBID(DBClientConnection *c) {
@@ -161,14 +144,40 @@ namespace repl {
             if ( cmdObj["forShell"].trueValue() )
                 lastError.disableForCommand();
 
-            if (!check(errmsg, result))
-                return false;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
 
-            getGlobalReplicationCoordinator()->processReplSetGetStatus(&result);
-
-            return true;
+            status = getGlobalReplicationCoordinator()->processReplSetGetStatus(&result);
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetGetStatus;
+
+    class CmdReplSetGetConfig : public ReplSetCommand {
+    public:
+        virtual void help( stringstream &help ) const {
+            help << "Returns the current replica set configuration";
+            help << "{ replSetGetConfig : 1 }";
+            help << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
+        }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::replSetGetConfig);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
+        CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig", true) { }
+        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj,
+                         int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+
+            getGlobalReplicationCoordinator()->processReplSetGetConfig(&result);
+            return true;
+        }
+    } cmdReplSetGetConfig;
 
     class CmdReplSetReconfig : public ReplSetCommand {
         RWLock mutex; /* we don't need rw but we wanted try capability. :-( */
@@ -202,64 +211,13 @@ namespace repl {
                 return false;
             }
 
-            bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
-            if( force && !theReplSet ) {
-                replSettings.reconfig = cmdObj["replSetReconfig"].Obj().getOwned();
-                result.append("msg", "will try this config momentarily, try running rs.conf() again in a few seconds");
-                return true;
-            }
-
-            if ( !check(errmsg, result) ) {
-                return false;
-            }
-
-            if( !force && !theReplSet->box.getState().primary() ) {
-                errmsg = "replSetReconfig command must be sent to the current replica set primary.";
-                return false;
-            }
-
-            {
-                // just make sure we can get a write lock before doing anything else.  we'll reacquire one
-                // later.  of course it could be stuck then, but this check lowers the risk if weird things
-                // are up - we probably don't want a change to apply 30 minutes after the initial attempt.
-                time_t t = time(0);
-                Lock::GlobalWrite lk(txn->lockState());
-                if( time(0)-t > 20 ) {
-                    errmsg = "took a long time to get write lock, so not initiating.  Initiate when server less busy?";
-                    return false;
-                }
-            }
-
-            try {
-                scoped_ptr<ReplSetConfig> newConfig
-                        (ReplSetConfig::make(cmdObj["replSetReconfig"].Obj(), force));
-
-                log() << "replSet replSetReconfig config object parses ok, " <<
-                        newConfig->members.size() << " members specified" << rsLog;
-
-                if( !ReplSetConfig::legalChange(theReplSet->getConfig(), *newConfig, errmsg) ) {
-                    return false;
-                }
-
-                checkMembersUpForConfigChange(*newConfig, result, false);
-
-                log() << "replSet replSetReconfig [2]" << rsLog;
-
-                theReplSet->haveNewConfig(*newConfig, true);
-                ReplSet::startupStatusMsg.set("replSetReconfig'd");
-            }
-            catch( DBException& e ) {
-                log() << "replSet replSetReconfig exception: " << e.what() << rsLog;
-                throw;
-            }
-            catch( string& se ) {
-                log() << "replSet reconfig exception: " << se << rsLog;
-                errmsg = se;
-                return false;
-            }
-
-            resetSlaveCache();
-            return true;
+            ReplicationCoordinator::ReplSetReconfigArgs parsedArgs;
+            parsedArgs.newConfigObj =  cmdObj["replSetReconfig"].Obj();
+            parsedArgs.force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
+            Status status = getGlobalReplicationCoordinator()->processReplSetReconfig(txn,
+                                                                                      parsedArgs,
+                                                                                      &result);
+            return appendCommandStatus(result, status);
         }
     } cmdReplSetReconfig;
 
@@ -282,16 +240,14 @@ namespace repl {
         }
         CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") { }
         virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if( !check(errmsg, result) )
-                return false;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+
             int secs = (int) cmdObj.firstElement().numberInt();
-            if( theReplSet->freeze(secs) ) {
-                if( secs == 0 )
-                    result.append("info","unfreezing");
-            }
-            if( secs == 1 )
-                result.append("warning", "you really want to freeze for only 1 second?");
-            return true;
+            return appendCommandStatus(
+                    result,
+                    getGlobalReplicationCoordinator()->processReplSetFreeze(secs, &result));
         }
     } cmdReplSetFreeze;
 
@@ -312,15 +268,17 @@ namespace repl {
         }
         CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") { }
         virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if( !check(errmsg, result) )
-                return false;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
 
             bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
             int secs = (int) cmdObj.firstElement().numberInt();
             if( secs == 0 )
                 secs = 60;
 
-            Status status = getGlobalReplicationCoordinator()->stepDown(
+            status = getGlobalReplicationCoordinator()->stepDown(
+                    txn,
                     force,
                     ReplicationCoordinator::Milliseconds(0),
                     ReplicationCoordinator::Milliseconds(secs * 1000));
@@ -343,20 +301,16 @@ namespace repl {
         }
         CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") { }
         virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            if( !check(errmsg, result) )
-                return false;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
 
-            if (!theReplSet->setMaintenanceMode(cmdObj["replSetMaintenance"].trueValue())) {
-                if (theReplSet->isPrimary()) {
-                    errmsg = "primaries can't modify maintenance mode";
-                }
-                else {
-                    errmsg = "already out of maintenance mode";
-                }
-                return false;
-            }
-
-            return true;
+            return appendCommandStatus(
+                    result,
+                    getGlobalReplicationCoordinator()->processReplSetMaintenance(
+                            txn,
+                            cmdObj["replSetMaintenance"].trueValue(),
+                            &result));
         }
     } cmdReplSetMaintenance;
 
@@ -380,12 +334,15 @@ namespace repl {
                          string& errmsg, 
                          BSONObjBuilder& result, 
                          bool fromRepl) {
-            if (!check(errmsg, result)) {
-                return false;
-            }
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+
             string newTarget = cmdObj["replSetSyncFrom"].valuestrsafe();
-            result.append("syncFromRequested", newTarget);
-            return theReplSet->forceSyncFrom(newTarget, errmsg, result);
+            return appendCommandStatus(
+                    result,
+                    getGlobalReplicationCoordinator()->processReplSetSyncFrom(newTarget,
+                                                                              &result));
         }
     } cmdReplSetSyncFrom;
 
@@ -404,40 +361,40 @@ namespace repl {
         CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") { }
         virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg,
                          BSONObjBuilder& result, bool fromRepl) {
-            if (!check(errmsg, result))
-                return false;
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
 
             if (cmdObj.hasField("handshake")) {
                 // we have received a handshake, not an update message
                 // handshakes are done here to ensure the receiving end supports the update command
-                if (!cc().gotHandshake(cmdObj["handshake"].embeddedObject())) {
-                    errmsg = "node could not be found in replica set config during handshake";
-                    return false;
+
+                HandshakeArgs handshake;
+                status = handshake.initialize(cmdObj["handshake"].embeddedObject());
+                if (!status.isOK())
+                    return appendCommandStatus(result, status);
+
+                if (!handshake.hasMemberId()) {
+                    return appendCommandStatus(
+                            result,
+                            Status(ErrorCodes::NoSuchKey,
+                                   "replSetUpdatePosition handshake was missing 'member' field"));
                 }
-                // if we aren't primary, pass the handshake along
-                if (!theReplSet->isPrimary()) {
-                    theReplSet->syncSourceFeedback.forwardSlaveHandshake();
-                }
-                return true;
+
+                return appendCommandStatus(
+                        result,
+                        getGlobalReplicationCoordinator()->processHandshake(txn, handshake));
             }
 
-            uassert(16888, "optimes field should be an array with an object for each secondary",
-                    cmdObj["optimes"].type() == Array);
-            BSONArray optimes = BSONArray(cmdObj["optimes"].Obj());
-            BSONForEach(elem, optimes) {
-                BSONObj entry = elem.Obj();
-                OID id = entry["_id"].OID();
-                OpTime ot = entry["optime"]._opTime();
-                BSONObj config = entry["config"].Obj();
-                Status status = getGlobalReplicationCoordinator()->setLastOptime(id, ot, config);
-                if (!status.isOK()) {
-                    errmsg = str::stream() << "could not update position upstream; will retry"
-                                           << causedBy(status);
-                    result.append("code", status.code());
-                    return false;
-                }
-            }
-            return true;
+            UpdatePositionArgs args;
+            status = args.initialize(cmdObj);
+            if (!status.isOK())
+                return appendCommandStatus(result, status);
+            
+            return appendCommandStatus(
+                    result,
+                    getGlobalReplicationCoordinator()->processReplSetUpdatePosition(txn, args));
+                    
         }
     } cmdReplSetUpdatePosition;
 

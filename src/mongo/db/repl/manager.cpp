@@ -29,17 +29,23 @@
 *    it in the license file.
 */
 
-#include "mongo/db/repl/manager.h"
+#include "mongo/platform/basic.h"
 
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/client.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     /* check members OTHER THAN US to see if they think they are primary */
-    const Member * Manager::findOtherPrimary(bool& two) {
+    const Member * Manager::findOtherPrimary(OperationContext* txn, bool& two) {
         two = false;
         Member *m = rs->head();
         Member *p = 0;
@@ -55,7 +61,7 @@ namespace repl {
             m = m->next();
         }
         if( p )
-            noteARemoteIsPrimary(p);
+            noteARemoteIsPrimary(txn, p);
         return p;
     }
 
@@ -77,7 +83,7 @@ namespace repl {
         replLocalAuth();
     }
 
-    void Manager::noteARemoteIsPrimary(const Member *m) {
+    void Manager::noteARemoteIsPrimary(OperationContext* txn, const Member *m) {
         if( rs->box.getPrimary() == m )
             return;
         rs->_self->lhb() = "";
@@ -95,12 +101,12 @@ namespace repl {
                 // This primary didn't deliver an electionTime in its heartbeat;
                 // assume it's a pre-2.6 primary and always step down ourselves.
                 log() << "stepping down; another primary seen in replicaset";
-                rs->relinquish();
+                rs->relinquish(txn);
             }
             // 2.6 or greater primary.  Step down whoever has the older election time.
             else if (remoteElectionTime > rs->getElectionTime()) {
                 log() << "stepping down; another primary was elected more recently";
-                rs->relinquish();
+                rs->relinquish(txn);
             }
             else {
                 // else, stick around
@@ -113,7 +119,7 @@ namespace repl {
         rs->box.noteRemoteIsPrimary(m);
     }
 
-    void Manager::checkElectableSet() {
+    void Manager::checkElectableSet(OperationContext* txn) {
         unsigned otherOp = rs->lastOtherOpTime().getSecs();
         
         // make sure the electable set is up-to-date
@@ -140,11 +146,11 @@ namespace repl {
                 " is priority " << highestPriority->config().priority << " and " <<
                 (otherOp - highestPriority->hbinfo().opTime.getSecs()) << " seconds behind" << endl;
 
-            if (primary->h().isSelf()) {
+            if (isSelf(primary->h())) {
                 // replSetStepDown tries to acquire the same lock
                 // msgCheckNewState takes, so we can't call replSetStepDown on
                 // ourselves.
-                rs->relinquish();
+                rs->relinquish(txn);
             }
             else {
                 BSONObj cmd = BSON( "replSetStepDown" << 1 );
@@ -165,7 +171,7 @@ namespace repl {
         }
     }
 
-    void Manager::checkAuth() {
+    void Manager::checkAuth(OperationContext* txn) {
         int down = 0, authIssue = 0, total = 0;
 
         for( Member *m = rs->head(); m; m=m->next() ) {
@@ -188,7 +194,7 @@ namespace repl {
 
             if (rs->box.getPrimary() == rs->_self) {
                 log() << "auth problems, relinquishing primary" << rsLog;
-                rs->relinquish();
+                rs->relinquish(txn);
             }
 
             rs->blockSync(true);
@@ -201,12 +207,13 @@ namespace repl {
     /** called as the health threads get new results */
     void Manager::msgCheckNewState() {
         {
+            OperationContextImpl txn;
             RSBase::lock lk(rs);
 
             if( busyWithElectSelf ) return;
             
-            checkElectableSet();
-            checkAuth();
+            checkElectableSet(&txn);
+            checkAuth(&txn);
 
             const Member *p = rs->box.getPrimary();
 
@@ -220,7 +227,7 @@ namespace repl {
             const Member *p2;
             {
                 bool two;
-                p2 = findOtherPrimary(two);
+                p2 = findOtherPrimary(&txn, two);
                 if( two ) {
                     /* two other nodes think they are primary (asynchronously polled) -- wait for things to settle down. */
                     log() << "replSet info two primaries (transiently)" << rsLog;
@@ -229,7 +236,7 @@ namespace repl {
             }
 
             if( p2 ) {
-                noteARemoteIsPrimary(p2);
+                noteARemoteIsPrimary(&txn, p2);
                 return;
             }
 
@@ -247,7 +254,7 @@ namespace repl {
 
                 if( rs->elect.shouldRelinquish() ) {
                     log() << "can't see a majority of the set, relinquishing primary" << rsLog;
-                    rs->relinquish();
+                    rs->relinquish(&txn);
                 }
 
                 return;

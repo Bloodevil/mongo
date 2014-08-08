@@ -27,6 +27,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/scripting/engine_v8.h"
 
 #include "mongo/base/init.h"
@@ -34,11 +36,14 @@
 #include "mongo/scripting/v8_db.h"
 #include "mongo/scripting/v8_utils.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 using namespace mongoutils;
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kQuery);
 
 #ifndef _MSC_EXTENSIONS
     const int V8Scope::objectDepthLimit;
@@ -449,6 +454,10 @@ namespace mongo {
         return _pendingKill || _engine->interrupted();
     }
 
+    OperationContext* V8Scope::getOpContext() const {
+        return _opCtx;
+    }
+
     /**
      * Display a list of all known ops (for verbose output)
      */
@@ -471,7 +480,8 @@ namespace mongo {
           _cpuProfiler(),
           _interruptLock("ScopeInterruptLock"),
           _inNativeExecution(true),
-          _pendingKill(false) {
+          _pendingKill(false),
+          _opCtx(NULL) {
 
         // create new isolate and enter it via a scope
         _isolate.set(v8::Isolate::New());
@@ -607,8 +617,7 @@ namespace mongo {
             // execution terminated
             return v8::Undefined();
 
-        v8::Local<v8::External> f =
-                v8::External::Cast(*args.Callee()->Get(scope->strLitToV8("_v8_function")));
+        v8::Local<v8::External> f = v8::Local<v8::External>::Cast(args.Data());
         v8Function function = (v8Function)(f->Value());
         v8::Handle<v8::Value> ret;
         string exceptionText;
@@ -1173,8 +1182,9 @@ namespace mongo {
     }
 
     v8::Handle<v8::FunctionTemplate> V8Scope::createV8Function(v8Function func) {
-        v8::Handle<v8::FunctionTemplate> ft = v8::FunctionTemplate::New(v8Callback);
-        ft->Set(strLitToV8("_v8_function"), v8::External::New(reinterpret_cast<void*>(func)),
+        v8::Handle<v8::Value> funcHandle = v8::External::New(reinterpret_cast<void*>(func));
+        v8::Handle<v8::FunctionTemplate> ft = v8::FunctionTemplate::New(v8Callback, funcHandle);
+        ft->Set(strLitToV8("_v8_function"), v8::Boolean::New(true),
                 static_cast<v8::PropertyAttribute>(v8::DontEnum | v8::ReadOnly));
         return ft;
     }
@@ -1186,10 +1196,14 @@ namespace mongo {
         v8::V8::LowMemoryNotification();
     }
 
-    void V8Scope::localConnect(const char * dbName) {
+    void V8Scope::localConnectForDbEval(OperationContext* txn, const char * dbName) {
         typedef v8::Persistent<v8::FunctionTemplate> FTPtr;
         {
-            V8_SIMPLE_HEADER
+            V8_SIMPLE_HEADER;
+
+            invariant(_opCtx == NULL);
+            _opCtx = txn;
+
             if (_connectState == EXTERNAL)
                 uasserted(12510, "externalSetup already called, can't call localConnect");
             if (_connectState ==  LOCAL) {
@@ -1216,7 +1230,7 @@ namespace mongo {
             _connectState = LOCAL;
             _localDBName = dbName;
         }
-        loadStored();
+        loadStored(txn);
     }
 
     void V8Scope::externalSetup() {
@@ -1381,7 +1395,7 @@ namespace mongo {
 
         switch (elem.type()) {
         case mongo::Code:
-            return newFunction(StringData(elem.valuestr(), elem.valuestrsize() - 1));
+            return newFunction(elem.valueStringData());
         case CodeWScope:
             if (!elem.codeWScopeObject().isEmpty())
                 log() << "warning: CodeWScope doesn't transfer to db.eval" << endl;

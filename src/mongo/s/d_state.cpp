@@ -34,7 +34,7 @@
    mostly around shard management and checking
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <map>
 #include <string>
@@ -48,7 +48,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/db.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/client/connpool.h"
@@ -60,9 +60,12 @@
 #include "mongo/util/queue.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/log.h"
 
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     // -----ShardingState START ----
 
@@ -382,7 +385,8 @@ namespace mongo {
         _collMetadata.erase( ns );
     }
 
-    Status ShardingState::refreshMetadataIfNeeded( const string& ns,
+    Status ShardingState::refreshMetadataIfNeeded( OperationContext* txn,
+                                                   const string& ns,
                                                    const ChunkVersion& reqShardVersion,
                                                    ChunkVersion* latestShardVersion )
     {
@@ -444,15 +448,17 @@ namespace mongo {
                      << ", need to verify with config server" << endl;
         }
 
-        return doRefreshMetadata( ns, reqShardVersion, true, latestShardVersion );
+        return doRefreshMetadata(txn, ns, reqShardVersion, true, latestShardVersion);
     }
 
-    Status ShardingState::refreshMetadataNow( const string& ns, ChunkVersion* latestShardVersion )
-    {
-        return doRefreshMetadata( ns, ChunkVersion( 0, 0, OID() ), false, latestShardVersion );
+    Status ShardingState::refreshMetadataNow(OperationContext* txn,
+                                             const string& ns,
+                                             ChunkVersion* latestShardVersion) {
+        return doRefreshMetadata(txn, ns, ChunkVersion(0, 0, OID()), false, latestShardVersion);
     }
 
-    Status ShardingState::doRefreshMetadata( const string& ns,
+    Status ShardingState::doRefreshMetadata( OperationContext* txn,
+                                             const string& ns,
                                              const ChunkVersion& reqShardVersion,
                                              bool useRequestedVersion,
                                              ChunkVersion* latestShardVersion )
@@ -572,8 +578,7 @@ namespace mongo {
         {
             // DBLock needed since we're now potentially changing the metadata, and don't want
             // reads/writes to be ongoing.
-            OperationContextImpl txn;
-            Lock::DBWrite writeLk(txn.lockState(), ns );
+            Lock::DBWrite writeLk(txn->lockState(), ns );
 
             //
             // Get the metadata now that the load has completed
@@ -1117,7 +1122,7 @@ namespace mongo {
             }
 
             ChunkVersion currVersion;
-            Status status = shardingState.refreshMetadataIfNeeded( ns, version, &currVersion );
+            Status status = shardingState.refreshMetadataIfNeeded(txn, ns, version, &currVersion);
 
             if (!status.isOK()) {
 
@@ -1247,7 +1252,7 @@ namespace mongo {
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(dbname);
+            Client::Context ctx(txn, dbname);
 
             shardingState.appendInfo( result );
             return true;

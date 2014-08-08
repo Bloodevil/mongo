@@ -43,7 +43,7 @@ namespace repl {
 
     public:
 
-        ReplicationCoordinatorMock();
+        ReplicationCoordinatorMock(const ReplSettings& settings);
         virtual ~ReplicationCoordinatorMock();
 
         virtual void startReplication(TopologyCoordinator* topCoord,
@@ -51,7 +51,7 @@ namespace repl {
 
         virtual void shutdown();
 
-        virtual bool isShutdownOkay() const;
+        virtual ReplSettings& getSettings();
 
         virtual bool isReplEnabled() const;
 
@@ -68,11 +68,13 @@ namespace repl {
                 const OperationContext* txn,
                 const WriteConcernOptions& writeConcern);
 
-        virtual Status stepDown(bool force,
+        virtual Status stepDown(OperationContext* txn, 
+                                bool force,
                                 const Milliseconds& waitTime,
                                 const Milliseconds& stepdownTime);
 
-        virtual Status stepDownAndWaitForSecondary(const Milliseconds& initialWaitTime,
+        virtual Status stepDownAndWaitForSecondary(OperationContext* txn,
+                                                   const Milliseconds& initialWaitTime,
                                                    const Milliseconds& stepdownTime,
                                                    const Milliseconds& postStepdownWaitTime);
 
@@ -80,16 +82,83 @@ namespace repl {
 
         virtual bool canAcceptWritesForDatabase(const StringData& dbName);
 
-        virtual bool canServeReadsFor(const NamespaceString& collection);
+        virtual Status checkIfWriteConcernCanBeSatisfied(
+                const WriteConcernOptions& writeConcern) const;
+
+        virtual Status canServeReadsFor(OperationContext* txn,
+                                        const NamespaceString& ns,
+                                        bool slaveOk);
 
         virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
 
-        virtual Status setLastOptime(const OID& rid, const OpTime& ts, const BSONObj& config);
+        virtual Status setLastOptime(OperationContext* txn, const OID& rid, const OpTime& ts);
 
-        virtual void processReplSetGetStatus(BSONObjBuilder* result);
+        virtual OID getElectionId();
 
-        virtual Status processHeartbeat(const BSONObj& cmdObj, 
-                                        BSONObjBuilder* resultObj);
+        virtual OID getMyRID(OperationContext* txn);
+
+        virtual void prepareReplSetUpdatePositionCommand(OperationContext* txn,
+                                                         BSONObjBuilder* cmdBuilder);
+
+        virtual void prepareReplSetUpdatePositionCommandHandshakes(
+                OperationContext* txn,
+                std::vector<BSONObj>* handshakes);
+
+        virtual Status processReplSetGetStatus(BSONObjBuilder* result);
+
+        virtual void processReplSetGetConfig(BSONObjBuilder* result);
+
+        virtual bool setMaintenanceMode(OperationContext* txn, bool activate);
+
+        virtual Status processReplSetMaintenance(OperationContext* txn,
+                                                 bool activate,
+                                                 BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetSyncFrom(const std::string& target,
+                                              BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj);
+
+        virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
+                                        ReplSetHeartbeatResponse* response);
+
+        virtual Status processReplSetReconfig(OperationContext* txn,
+                                              const ReplSetReconfigArgs& args,
+                                              BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetInitiate(OperationContext* txn,
+                                              const BSONObj& configObj,
+                                              BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetGetRBID(BSONObjBuilder* resultObj);
+
+        virtual void incrementRollbackID();
+
+        virtual Status processReplSetFresh(const ReplSetFreshArgs& args,
+                                           BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetElect(const ReplSetElectArgs& args,
+                                           BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetUpdatePosition(OperationContext* txn,
+                                                    const UpdatePositionArgs& updates);
+
+        virtual Status processHandshake(const OperationContext* txn,
+                                        const HandshakeArgs& handshake);
+
+        virtual void waitUpToOneSecondForOptimeChange(const OpTime& ot);
+
+        virtual bool buildsIndexes();
+
+        virtual std::vector<BSONObj> getHostsWrittenTo(const OpTime& op);
+
+        virtual BSONObj getGetLastErrorDefault();
+
+        virtual Status checkReplEnabledForCommand(BSONObjBuilder* result);
+
+    private:
+
+        ReplSettings _settings;
     };
 
 } // namespace repl

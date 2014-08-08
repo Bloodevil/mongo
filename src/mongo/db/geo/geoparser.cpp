@@ -52,10 +52,6 @@ namespace mongo {
     static const string GEOJSON_COORDINATES = "coordinates";
     static const string GEOJSON_GEOMETRIES = "geometries";
 
-    bool isValidLngLat(double lng, double lat) {
-        return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
-    }
-
     static bool isGeoJSONPoint(const BSONObj& obj) {
         BSONElement type = obj.getFieldDotted(GEOJSON_TYPE);
         if (type.eoo() || (String != type.type())) { return false; }
@@ -72,12 +68,13 @@ namespace mongo {
         const vector<BSONElement>& coordinates = coordElt.Array();
         if (coordinates.size() != 2) { return false; }
         if (!coordinates[0].isNumber() || !coordinates[1].isNumber()) { return false; }
+        // For now, we assume all GeoJSON must be within WGS84 - this may change
         double lat = coordinates[1].Number();
         double lng = coordinates[0].Number();
         return isValidLngLat(lng, lat);
     }
 
-    static bool isLegacyPoint(const BSONObj &obj) {
+    static bool isLegacyPoint(const BSONObj &obj, bool allowAddlFields) {
         BSONObjIterator it(obj);
         if (!it.more()) { return false; }
         BSONElement x = it.next();
@@ -85,7 +82,7 @@ namespace mongo {
         if (!it.more()) { return false; }
         BSONElement y = it.next();
         if (!y.isNumber()) { return false; }
-        if (it.more()) { return false; }
+        if (it.more() && !allowAddlFields) { return false; }
         return true;
     }
 
@@ -269,7 +266,7 @@ namespace mongo {
         while (coordIt.more()) {
             BSONElement coord = coordIt.next();
             if (!coord.isABSONObj()) { return false; }
-            if (!isLegacyPoint(coord.Obj())) { return false; }
+            if (!isLegacyPoint(coord.Obj(), false)) { return false; }
             ++vertices;
         }
         if (vertices < 3) { return false; }
@@ -285,7 +282,7 @@ namespace mongo {
         BSONObjIterator objIt(type.embeddedObject());
         BSONElement center = objIt.next();
         if (!center.isABSONObj()) { return false; }
-        if (!isLegacyPoint(center.Obj())) { return false; }
+        if (!isLegacyPoint(center.Obj(), false)) { return false; }
         if (!objIt.more()) { return false; }
         BSONElement radius = objIt.next();
         if (!radius.isNumber()) { return false; }
@@ -301,7 +298,7 @@ namespace mongo {
         BSONObjIterator objIt(type.embeddedObject());
         BSONElement center = objIt.next();
         if (!center.isABSONObj()) { return false; }
-        if (!isLegacyPoint(center.Obj())) { return false; }
+        if (!isLegacyPoint(center.Obj(), false)) { return false; }
         // Check to make sure the points are valid lng/lat.
         BSONObjIterator coordIt(center.Obj());
         BSONElement lng = coordIt.next();
@@ -316,31 +313,30 @@ namespace mongo {
     /** exported **/
 
     bool GeoParser::isPoint(const BSONObj &obj) {
-        return isGeoJSONPoint(obj) || isLegacyPoint(obj);
+        return isLegacyPoint(obj, false) || isGeoJSONPoint(obj);
+    }
+
+    bool GeoParser::isIndexablePoint(const BSONObj &obj) {
+        return isLegacyPoint(obj, true) || isGeoJSONPoint(obj);
     }
 
     bool GeoParser::parsePoint(const BSONObj &obj, PointWithCRS *out) {
-        if (isGeoJSONPoint(obj)) {
-            const vector<BSONElement>& coords = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
-            out->point = coordToPoint(coords[0].Number(), coords[1].Number());
-            out->cell = S2Cell(out->point);
-            out->oldPoint.x = coords[0].Number();
-            out->oldPoint.y = coords[1].Number(); 
-            out->crs = SPHERE;
-        } else if (isLegacyPoint(obj)) {
+        if (isLegacyPoint(obj, true)) {
             BSONObjIterator it(obj);
             BSONElement x = it.next();
             BSONElement y = it.next();
-            if (isValidLngLat(x.Number(), y.Number())) {
-                out->flatUpgradedToSphere = true;
-                out->point = coordToPoint(x.Number(), y.Number());
-                out->cell = S2Cell(out->point);
-            }
             out->oldPoint.x = x.Number();
             out->oldPoint.y = y.Number(); 
             out->crs = FLAT;
+        } else if (isGeoJSONPoint(obj)) {
+            const vector<BSONElement>& coords = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
+            out->oldPoint.x = coords[0].Number();
+            out->oldPoint.y = coords[1].Number();
+            out->crs = FLAT;
+            if (!ShapeProjection::supportsProject(*out, SPHERE))
+                return false;
+            ShapeProjection::projectInto(out, SPHERE);
         }
-
         return true;
     }
 
@@ -379,11 +375,11 @@ namespace mongo {
         BSONObjIterator coordIt(type.embeddedObject());
         BSONElement minE = coordIt.next();
         if (!minE.isABSONObj()) { return false; }
-        if (!isLegacyPoint(minE.Obj())) { return false; }
+        if (!isLegacyPoint(minE.Obj(), false)) { return false; }
         if (!coordIt.more()) { return false; }
         BSONElement maxE = coordIt.next();
         if (!maxE.isABSONObj()) { return false; }
-        if (!isLegacyPoint(maxE.Obj())) { return false; }
+        if (!isLegacyPoint(maxE.Obj(), false)) { return false; }
         // XXX: VERIFY AREA >= 0
         return true;
     }
@@ -600,6 +596,8 @@ namespace mongo {
             if (!parseLegacyPoint(center.Obj(), &out->circle.center)) { return false; }
             BSONElement radius = objIt.next();
             out->circle.radius = radius.number();
+            if (out->circle.radius < 0)
+                return false;
             out->crs = FLAT;
         } else {
             verify(isLegacyCenterSphere(obj));
@@ -615,6 +613,8 @@ namespace mongo {
             centerPoint = coordToPoint(x.Number(), y.Number());
             BSONElement radiusElt = objIt.next();
             double radius = radiusElt.number();
+            if (radius < 0)
+                return false;
             out->cap = S2Cap::FromAxisAngle(centerPoint, S1Angle::Radians(radius));
             out->circle.radius = radius;
             out->circle.center = Point(x.Number(), y.Number());
@@ -678,15 +678,10 @@ namespace mongo {
         if (!dist.isNumber()) { return false; }
         if (it.more()) { return false; }
 
-        out->crs = FLAT;
         out->oldPoint.x = lng.number();
         out->oldPoint.y = lat.number();
+        out->crs = FLAT;
         *maxOut = dist.number();
-        if (isValidLngLat(lng.Number(), lat.Number())) {
-            out->flatUpgradedToSphere = true;
-            out->point = coordToPoint(lng.Number(), lat.Number());
-            out->cell = S2Cell(out->point);
-        }
         return true;
     }
 

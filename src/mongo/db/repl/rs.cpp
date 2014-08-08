@@ -34,28 +34,20 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/repl_set_impl.h"
 #include "mongo/db/server_parameters.h"
 
-using namespace std;
-
 namespace mongo {
 namespace repl {
     
-    using namespace bson;
-
-    bool replSet = false;
     ReplSet *theReplSet = 0;
 
     // This is a bitmask with the first bit set. It's used to mark connections that should be kept
     // open during stepdowns
     const unsigned ScopedConn::keepOpen = 1;
-
-    bool isCurrentlyAReplSetPrimary() {
-        return theReplSet && theReplSet->isPrimary();
-    }
 
     void sethbmsg(const string& s, const int level) {
         if (theReplSet) {
@@ -66,22 +58,21 @@ namespace repl {
     ReplSet::ReplSet() {
     }
 
-    ReplSet* ReplSet::make(ReplSetSeedList& replSetSeedList) {
+    ReplSet* ReplSet::make(OperationContext* txn, ReplSetSeedList& replSetSeedList) {
         auto_ptr<ReplSet> ret(new ReplSet());
-        ret->init(replSetSeedList);
+        ret->init(txn, replSetSeedList);
         return ret.release();
     }
 
     ReplSetImpl::StartupStatus ReplSetImpl::startupStatus = PRESTART;
     DiagStr ReplSetImpl::startupStatusMsg;
-    ReplicationStartSynchronizer ReplSetImpl::rss;
 
-    void ReplSet::haveNewConfig(ReplSetConfig& newConfig, bool addComment) {
+    void ReplSet::haveNewConfig(OperationContext* txn, ReplSetConfig& newConfig, bool addComment) {
         bo comment;
         if( addComment )
             comment = BSON( "msg" << "Reconfig set" << "version" << newConfig.version );
 
-        newConfig.saveConfigLocally(comment);
+        newConfig.saveConfigLocally(txn, comment);
 
         try {
             BSONObj oldConfForAudit = config().asBson();
@@ -89,7 +80,7 @@ namespace repl {
             audit::logReplSetReconfig(ClientBasic::getCurrent(),
                                       &oldConfForAudit,
                                       &newConfForAudit);
-            if (initFromConfig(newConfig, true)) {
+            if (initFromConfig(txn, newConfig, true)) {
                 log() << "replSet replSetReconfig new config saved locally" << rsLog;
             }
         }
@@ -104,10 +95,12 @@ namespace repl {
     }
 
     void Manager::msgReceivedNewConfig(BSONObj o) {
+        OperationContextImpl txn;
+
         log() << "replset msgReceivedNewConfig version: " << o["version"].toString() << rsLog;
         scoped_ptr<ReplSetConfig> config(ReplSetConfig::make(o));
         if( config->version > rs->config().version )
-            theReplSet->haveNewConfig(*config, false);
+            theReplSet->haveNewConfig(&txn, *config, false);
         else {
             log() << "replSet info msgReceivedNewConfig but version isn't higher " <<
                   config->version << ' ' << rs->config().version << rsLog;
@@ -121,14 +114,15 @@ namespace repl {
     */
     void startReplSets(ReplSetSeedList *replSetSeedList) {
         Client::initThread("rsStart");
+        OperationContextImpl txn;
+
         try {
             verify( theReplSet == 0 );
             if( replSetSeedList == 0 ) {
-                verify(!replSet);
                 return;
             }
             replLocalAuth();
-            (theReplSet = ReplSet::make(*replSetSeedList))->go();
+            (theReplSet = ReplSet::make(&txn, *replSetSeedList))->go();
         }
         catch(std::exception& e) {
             log() << "replSet caught exception in startReplSets thread: " << e.what() << rsLog;

@@ -36,7 +36,7 @@ namespace mongo {
     enum StageType {
         STAGE_AND_HASH,
         STAGE_AND_SORTED,
-	STAGE_CACHED_PLAN,
+        STAGE_CACHED_PLAN,
         STAGE_COLLSCAN,
 
         // If we're running a .count(), the query is fully covered by one ixscan, and the ixscan is
@@ -44,9 +44,16 @@ namespace mongo {
         // them.
         STAGE_COUNT,
 
+        STAGE_DELETE,
+
         // If we're running a distinct, we only care about one value for each key.  The distinct
         // stage is an ixscan with some key-skipping behvaior that only distinct uses.
         STAGE_DISTINCT,
+
+        // Dummy stage used for receiving notifications of deletions during chunk migration.
+        STAGE_NOTIFY_DELETE,
+
+        STAGE_EOF,
 
         // This is more of an "internal-only" stage where we try to keep docs that were mutated
         // during query execution.
@@ -58,15 +65,27 @@ namespace mongo {
         STAGE_GEO_NEAR_2D,
         STAGE_GEO_NEAR_2DSPHERE,
 
+        STAGE_IDHACK,
         STAGE_IXSCAN,
         STAGE_LIMIT,
-	STAGE_MULTI_PLAN,
+        STAGE_MOCK,
+
+        // Implements parallelCollectionScan.
+        STAGE_MULTI_ITERATOR,
+
+        STAGE_MULTI_PLAN,
+        STAGE_OPLOG_START,
         STAGE_OR,
         STAGE_PROJECTION,
+
+        // Stage for running aggregation pipelines.
+        STAGE_PIPELINE_PROXY,
+
         STAGE_SHARDING_FILTER,
         STAGE_SKIP,
         STAGE_SORT,
         STAGE_SORT_MERGE,
+        STAGE_SUBPLAN,
         STAGE_TEXT,
         STAGE_UNKNOWN,
     };

@@ -638,7 +638,7 @@ namespace mongo {
     //
     // LimitNode
     //
-    
+
 
     void LimitNode::appendToString(mongoutils::str::stream* ss, int indent) const {
         addIndent(ss, indent);
@@ -708,7 +708,7 @@ namespace mongo {
 
         copy->_sorts = this->_sorts;
         copy->nq = this->nq;
-        copy->numWanted = this->numWanted;
+        copy->baseBounds = this->baseBounds;
         copy->indexKeyPattern = this->indexKeyPattern;
         copy->addPointMeta = this->addPointMeta;
         copy->addDistMeta = this->addDistMeta;

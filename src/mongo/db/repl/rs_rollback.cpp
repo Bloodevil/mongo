@@ -1,6 +1,6 @@
 /* @file rs_rollback.cpp
 *
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -27,7 +27,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
@@ -40,8 +40,10 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 /* Scenarios
  *
@@ -82,11 +84,10 @@
  */
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
-
-    using namespace bson;
-
-    void incRBID();
 
     class RSFatalException : public std::exception {
     public:
@@ -231,17 +232,18 @@ namespace repl {
     int getRBID(DBClientConnection*);
 
     static void syncRollbackFindCommonPoint(OperationContext* txn, DBClientConnection* them, FixUpInfo& fixUpInfo) {
-        Client::Context ctx(rsoplog);
+        Client::Context ctx(txn, rsoplog);
 
-        boost::scoped_ptr<Runner> runner(
-                InternalPlanner::collectionScan(rsoplog,
+        boost::scoped_ptr<PlanExecutor> exec(
+                InternalPlanner::collectionScan(txn,
+                                                rsoplog,
                                                 ctx.db()->getCollection(txn, rsoplog),
                                                 InternalPlanner::BACKWARD));
 
         BSONObj ourObj;
         DiskLoc ourLoc;
 
-        if (Runner::RUNNER_ADVANCED != runner->getNext(&ourObj, &ourLoc)) {
+        if (PlanExecutor::ADVANCED != exec->getNext(&ourObj, &ourLoc)) {
             throw RSFatalException("our oplog empty or unreadable");
         }
 
@@ -302,7 +304,7 @@ namespace repl {
                 theirObj = oplogCursor->nextSafe();
                 theirTime = theirObj["ts"]._opTime();
 
-                if (Runner::RUNNER_ADVANCED != runner->getNext(&ourObj, &ourLoc)) {
+                if (PlanExecutor::ADVANCED != exec->getNext(&ourObj, &ourLoc)) {
                     log() << "replSet rollback error RS101 reached beginning of local oplog"
                           << rsLog;
                     log() << "replSet   them:      " << them->toString() << " scanned: "
@@ -329,7 +331,7 @@ namespace repl {
             else {
                 // theirTime < ourTime
                 refetch(fixUpInfo, ourObj);
-                if (Runner::RUNNER_ADVANCED != runner->getNext(&ourObj, &ourLoc)) {
+                if (PlanExecutor::ADVANCED != exec->getNext(&ourObj, &ourLoc)) {
                     log() << "replSet rollback error RS101 reached beginning of local oplog"
                           << rsLog;
                     log() << "replSet   them:      " << them->toString() << " scanned: "
@@ -353,7 +355,7 @@ namespace repl {
         // cloner owns _conn in auto_ptr
         cloner.setConnection(tmpConn);
         uassert(15908, errmsg,
-                tmpConn->connect(host, errmsg) && repl::replAuthenticate(tmpConn));
+                tmpConn->connect(HostAndPort(host), errmsg) && repl::replAuthenticate(tmpConn));
 
         return cloner.copyCollection(txn, ns, BSONObj(), errmsg, true, false, true, false);
     }
@@ -425,7 +427,7 @@ namespace repl {
         // we have items we are writing that aren't from a point-in-time.  thus best not to come
         // online until we get to that point in freshness.
         log() << "replSet minvalid=" << newMinValid["ts"]._opTime().toStringLong() << rsLog;
-        setMinValid(newMinValid);
+        setMinValid(txn, newMinValid);
 
         // any full collection resyncs required?
         if (!fixUpInfo.collectionsToResync.empty()) {
@@ -471,7 +473,7 @@ namespace repl {
                 else {
                     log() << "replSet minvalid=" << newMinValid["ts"]._opTime().toStringLong()
                           << rsLog;
-                    setMinValid(newMinValid);
+                    setMinValid(txn, newMinValid);
                 }
             }
             catch (DBException& e) {
@@ -500,13 +502,13 @@ namespace repl {
         for (set<string>::iterator it = fixUpInfo.toDrop.begin();
                 it != fixUpInfo.toDrop.end();
                 it++) {
-            Client::Context ctx(*it);
+            Client::Context ctx(txn, *it);
             log() << "replSet rollback drop: " << *it << rsLog;
             ctx.db()->dropCollection(txn, *it);
         }
 
         sethbmsg("rollback 4.7");
-        Client::Context ctx(rsoplog);
+        Client::Context ctx(txn, rsoplog);
         Collection* oplogCollection = ctx.db()->getCollection(txn, rsoplog);
         uassert(13423,
                 str::stream() << "replSet error in rollback can't find " << rsoplog,
@@ -544,7 +546,7 @@ namespace repl {
                     removeSaver.reset(new Helpers::RemoveSaver("rollback", "", doc.ns));
 
                 // todo: lots of overhead in context, this can be faster
-                Client::Context ctx(doc.ns);
+                Client::Context ctx(txn, doc.ns);
 
                 // Add the doc to our rollback file
                 BSONObj obj;
@@ -630,7 +632,7 @@ namespace repl {
                     updates++;
 
                     const NamespaceString requestNs(doc.ns);
-                    UpdateRequest request(requestNs);
+                    UpdateRequest request(txn, requestNs);
 
                     request.setQuery(pattern);
                     request.setUpdates(it->second);
@@ -639,7 +641,7 @@ namespace repl {
                     UpdateLifecycleImpl updateLifecycle(true, requestNs);
                     request.setLifecycle(&updateLifecycle);
 
-                    update(txn, ctx.db(), request, &debug);
+                    update(ctx.db(), request, &debug);
 
                 }
             }
@@ -660,14 +662,14 @@ namespace repl {
         // TODO: fatal error if this throws?
         oplogCollection->temp_cappedTruncateAfter(txn, fixUpInfo.commonPointOurDiskloc, false);
 
-        Status status = getGlobalAuthorizationManager()->initialize();
+        Status status = getGlobalAuthorizationManager()->initialize(txn);
         if (!status.isOK()) {
             warning() << "Failed to reinitialize auth data after rollback: " << status;
             warn = true;
         }
 
         // reset cached lastoptimewritten and h value
-        loadLastOpTimeWritten();
+        loadLastOpTimeWritten(txn);
 
         // done
         if (warn)
@@ -676,15 +678,14 @@ namespace repl {
             sethbmsg("rollback done");
     }
 
-    void ReplSetImpl::syncRollback(OplogReader& oplogreader) {
+    void ReplSetImpl::syncRollback(OperationContext* txn, OplogReader& oplogreader) {
         // check that we are at minvalid, otherwise we cannot rollback as we may be in an
         // inconsistent state
-        OperationContextImpl txn;
 
         {
-            Lock::DBRead lk(txn.lockState(), "local.replset.minvalid");
+            Lock::DBRead lk(txn->lockState(), "local.replset.minvalid");
             BSONObj mv;
-            if (Helpers::getSingleton(&txn, "local.replset.minvalid", mv)) {
+            if (Helpers::getSingleton(txn, "local.replset.minvalid", mv)) {
                 OpTime minvalid = mv["ts"]._opTime();
                 if (minvalid > lastOpTimeWritten) {
                     log() << "replSet need to rollback, but in inconsistent state";
@@ -696,7 +697,7 @@ namespace repl {
             }
         }
 
-        unsigned s = _syncRollback(&txn, oplogreader);
+        unsigned s = _syncRollback(txn, oplogreader);
         if (s)
             sleepsecs(s);
     }
@@ -752,7 +753,7 @@ namespace repl {
 
         sethbmsg("replSet rollback 3 fixup");
 
-        incRBID();
+        getGlobalReplicationCoordinator()->incrementRollbackID();
         try {
             syncFixUp(txn, how, oplogreader);
         }
@@ -763,10 +764,10 @@ namespace repl {
             return 2;
         }
         catch (...) {
-            incRBID();
+            getGlobalReplicationCoordinator()->incrementRollbackID();
             throw;
         }
-        incRBID();
+        getGlobalReplicationCoordinator()->incrementRollbackID();
 
         // success - leave "ROLLBACK" state
         // can go to SECONDARY once minvalid is achieved

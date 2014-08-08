@@ -1,7 +1,7 @@
 // d_migrate.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,7 +34,7 @@
    mostly around shard management and checking
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <algorithm>
 #include <boost/thread/thread.hpp>
@@ -53,6 +53,7 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/hasher.h"
@@ -78,6 +79,7 @@
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/startup_test.h"
@@ -87,10 +89,38 @@
 
 using namespace std;
 
+namespace {
+    using mongo::WriteConcernOptions;
+    using mongo::repl::ReplicationCoordinator;
+
+    const int kDefaultWTimeoutMs = 60 * 1000;
+    const WriteConcernOptions DefaultWriteConcern(2, WriteConcernOptions::NONE, kDefaultWTimeoutMs);
+
+    /**
+     * Returns the default write concern for migration cleanup (at donor shard) and
+     * cloning documents (at recipient shard).
+     */
+    WriteConcernOptions getDefaultWriteConcern() {
+        ReplicationCoordinator* replCoordinator =
+                mongo::repl::getGlobalReplicationCoordinator();
+        mongo::Status status =
+                replCoordinator->checkIfWriteConcernCanBeSatisfied(DefaultWriteConcern);
+
+        if (status.isOK()) {
+            return DefaultWriteConcern;
+        }
+
+        return WriteConcernOptions(1, WriteConcernOptions::NONE, 0);
+    }
+}
+
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     MONGO_FP_DECLARE(failMigrationCommit);
     MONGO_FP_DECLARE(failMigrationConfigWritePrepare);
+    MONGO_FP_DECLARE(failMigrationApplyOps);
 
     Tee* migrateLog = RamLog::get("migrate");
 
@@ -235,7 +265,7 @@ namespace mongo {
                     "section" << endl;
 
 
-            _dummyRunner.reset( NULL );
+            _deleteNotifyExec.reset( NULL );
 
             Lock::GlobalWrite lk(txn->lockState());
             log() << "MigrateFromStatus::done Global lock acquired" << endl;
@@ -308,7 +338,7 @@ namespace mongo {
                 break;
 
             case 'u':
-                Client::Context ctx( _ns );
+                Client::Context ctx(txn,  _ns );
                 if ( ! Helpers::findById( txn, ctx.db(), _ns.c_str(), ide.wrap(), it ) ) {
                     warning() << "logOpForSharding couldn't find: " << ide << " even though should have" << migrateLog;
                     return;
@@ -395,8 +425,13 @@ namespace mongo {
                 return false;
             }
 
-            invariant( _dummyRunner.get() == NULL );
-            _dummyRunner.reset(new DummyRunner(txn, _ns, collection));
+            invariant( _deleteNotifyExec.get() == NULL );
+            WorkingSet* ws = new WorkingSet();
+            DeleteNotificationStage* dns = new DeleteNotificationStage();
+            // Takes ownership of 'ws' and 'dns'.
+            PlanExecutor* deleteNotifyExec = new PlanExecutor(ws, dns, collection);
+            deleteNotifyExec->registerExecInternalPlan();
+            _deleteNotifyExec.reset(deleteNotifyExec);
 
             // Allow multiKey based on the invariant that shard keys must be single-valued.
             // Therefore, any multi-key index prefixed by shard key cannot be multikey over
@@ -414,7 +449,8 @@ namespace mongo {
             BSONObj min = Helpers::toKeyFormat( kp.extendRangeBound( _min, false ) );
             BSONObj max = Helpers::toKeyFormat( kp.extendRangeBound( _max, false ) );
 
-            auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx, min, max, false));
+            auto_ptr<PlanExecutor> exec(
+                InternalPlanner::indexScan(txn, collection, idx, min, max, false));
 
             // use the average object size to estimate how many objects a full chunk would carry
             // do that while traversing the chunk's range using the sharding index, below
@@ -437,7 +473,7 @@ namespace mongo {
             bool isLargeChunk = false;
             unsigned long long recCount = 0;;
             DiskLoc dl;
-            while (Runner::RUNNER_ADVANCED == runner->getNext(NULL, &dl)) {
+            while (PlanExecutor::ADVANCED == exec->getNext(NULL, &dl)) {
                 if ( ! isLargeChunk ) {
                     scoped_spinlock lk( _trackerLocks );
                     _cloneLocs.insert( dl );
@@ -447,7 +483,7 @@ namespace mongo {
                     isLargeChunk = true;
                 }
             }
-            runner.reset();
+            exec.reset();
 
             if ( isLargeChunk ) {
                 warning() << "cannot move chunk: the maximum number of documents for a chunk is "
@@ -600,26 +636,16 @@ namespace mongo {
         bool _getActive() const { scoped_lock l(_mutex); return _active; }
         void _setActive( bool b ) { scoped_lock l(_mutex); _active = b; }
 
-
-        class DummyRunner : public Runner {
+        /**
+         * Used to receive invalidation notifications.
+         *
+         * XXX: move to the exec/ directory.
+         */
+        class DeleteNotificationStage : public PlanStage {
         public:
-            DummyRunner(OperationContext* txn,
-                        const StringData& ns,
-                        Collection* collection ) {
-                _ns = ns.toString();
-                _txn = txn;
-                _collection = collection;
-                _collection->cursorCache()->registerRunner( this );
-            }
-            ~DummyRunner() {
-                if ( !_collection )
-                    return;
-                Client::ReadContext ctx(_txn, _ns);
-                Collection* collection = ctx.ctx().db()->getCollection( _txn, _ns );
-                invariant( _collection == collection );
-                _collection->cursorCache()->deregisterRunner( this );
-            }
-            virtual RunnerState getNext(BSONObj* objOut, DiskLoc* dlOut) {
+            virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+
+            virtual StageState work(WorkingSetID* out) {
                 invariant( false );
             }
             virtual bool isEOF() {
@@ -627,38 +653,42 @@ namespace mongo {
                 return false;
             }
             virtual void kill() {
-                _collection = NULL;
             }
             virtual void saveState() {
                 invariant( false );
             }
-            virtual bool restoreState(OperationContext* opCtx) {
+            virtual void restoreState(OperationContext* opCtx) {
                 invariant( false );
             }
-            virtual const string& ns() {
+            virtual PlanStageStats* getStats() {
                 invariant( false );
-                return _ns;
+                return NULL;
             }
-            virtual void invalidate(const DiskLoc& dl, InvalidationType type);
-            virtual const Collection* collection() {
-                return _collection;
+            virtual CommonStats* getCommonStats() {
+                invariant( false );
+                return NULL;
             }
-            virtual Status getInfo(TypeExplain** explain, PlanInfo** planInfo) const {
-                return Status( ErrorCodes::InternalError, "no" );
+            virtual SpecificStats* getSpecificStats() {
+                invariant( false );
+                return NULL;
             }
-
-        private:
-            string _ns;
-            OperationContext* _txn;
-            Collection* _collection;
+            virtual std::vector<PlanStage*> getChildren() const {
+                invariant( false );
+                vector<PlanStage*> empty;
+                return empty;
+            }
+            virtual StageType stageType() const {
+                invariant( false );
+                return STAGE_NOTIFY_DELETE;
+            }
         };
 
-        scoped_ptr<DummyRunner> _dummyRunner;
+        scoped_ptr<PlanExecutor> _deleteNotifyExec;
 
     } migrateFromStatus;
 
-    void MigrateFromStatus::DummyRunner::invalidate(const DiskLoc& dl,
-                                                    InvalidationType type) {
+    void MigrateFromStatus::DeleteNotificationStage::invalidate(const DiskLoc& dl,
+                                                                InvalidationType type) {
         if ( type == INVALIDATION_DELETION ) {
             migrateFromStatus.aboutToDelete( dl );
         }
@@ -743,6 +773,24 @@ namespace mongo {
      * called to initial a move
      * usually by a mongos
      * this is called on the "from" side
+     *
+     * Format:
+     * {
+     *   moveChunk: "namespace",
+     *   from: "hostAndPort",
+     *   fromShard: "shardName",
+     *   to: "hostAndPort",
+     *   toShard: "shardName",
+     *   min: {},
+     *   max: {},
+     *   maxChunkBytes: numeric,
+     *   shardId: "_id of chunk document in config.chunks",
+     *   configdb: "hostAndPort",
+     *
+     *   // optional
+     *   secondaryThrottle: bool, //defaults to true.
+     *   writeConcern: {} // applies to individual writes.
+     * }
      */
     class MoveChunkCommand : public Command {
     public:
@@ -799,28 +847,33 @@ namespace mongo {
                 to = cmdObj["toShard"].String();
             }
 
-            // if we do a w=2 after every write
-            bool secondaryThrottle = cmdObj["secondaryThrottle"].trueValue();
-            if ( secondaryThrottle ) {
-                const repl::ReplicationCoordinator::Mode replMode =
-                        repl::getGlobalReplicationCoordinator()->getReplicationMode();
-                if (replMode == repl::ReplicationCoordinator::modeReplSet) {
-                    if (repl::theReplSet->config().getMajority() <= 1) {
-                        secondaryThrottle = false;
-                        warning() << "not enough nodes in set to use secondaryThrottle: "
-                                  << " majority: " << repl::theReplSet->config().getMajority()
-                                  << endl;
-                    }
+            // Process secondary throttle settings and assign defaults if necessary.
+            BSONObj secThrottleObj;
+            WriteConcernOptions writeConcern;
+            Status status = writeConcern.parseSecondaryThrottle(cmdObj, &secThrottleObj);
+
+            if (!status.isOK()){
+                if (status.code() != ErrorCodes::WriteConcernNotDefined) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
                 }
-                else if (replMode == repl::ReplicationCoordinator::modeNone) {
-                    secondaryThrottle = false;
-                    warning() << "secondaryThrottle selected but no replication" << endl;
+
+                writeConcern = getDefaultWriteConcern();
+            }
+            else {
+                repl::ReplicationCoordinator* replCoordinator =
+                        repl::getGlobalReplicationCoordinator();
+                Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcern);
+                if (!status.isOK()) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
                 }
-                else {
-                    // master/slave
-                    secondaryThrottle = false;
-                    warning() << "secondaryThrottle not allowed with master/slave" << endl;
-                }
+            }
+
+            if (writeConcern.shouldWaitForOtherNodes() &&
+                    writeConcern.wTimeout == WriteConcernOptions::kNoTimeout) {
+                // Don't allow no timeout.
+                writeConcern.wTimeout = kDefaultWTimeoutMs;
             }
 
             // Do inline deletion
@@ -998,7 +1051,7 @@ namespace mongo {
                 // TODO: The above checks should be removed, we should only have one refresh
                 // mechanism.
                 ChunkVersion startingVersion;
-                Status status = shardingState.refreshMetadataNow( ns, &startingVersion );
+                Status status = shardingState.refreshMetadataNow(txn, ns, &startingVersion );
 
                 if (!status.isOK()) {
                     errmsg = str::stream() << "moveChunk cannot start migrate of chunk "
@@ -1053,19 +1106,27 @@ namespace mongo {
                 ScopedDbConnection connTo(toShard.getConnString());
                 BSONObj res;
                 bool ok;
+
+                const bool isSecondaryThrottle(writeConcern.shouldWaitForOtherNodes());
+
+                BSONObjBuilder recvChunkStartBuilder;
+                recvChunkStartBuilder.append("_recvChunkStart", ns);
+                recvChunkStartBuilder.append("from", fromShard.getConnString());
+                recvChunkStartBuilder.append("fromShardName", fromShard.getName());
+                recvChunkStartBuilder.append("toShardName", toShard.getName());
+                recvChunkStartBuilder.append("min", min);
+                recvChunkStartBuilder.append("max", max);
+                recvChunkStartBuilder.append("shardKeyPattern", shardKeyPattern);
+                recvChunkStartBuilder.append("configServer", configServer.modelServer());
+                recvChunkStartBuilder.append("secondaryThrottle", isSecondaryThrottle);
+
+                // Follow the same convention in moveChunk.
+                if (isSecondaryThrottle && !secThrottleObj.isEmpty()) {
+                    recvChunkStartBuilder.append("writeConcern", secThrottleObj);
+                }
+
                 try{
-                    ok = connTo->runCommand( "admin" ,
-                                             BSON( "_recvChunkStart" << ns <<
-                                                   "from" << fromShard.getConnString() <<
-                                                   "fromShardName" << fromShard.getName() <<
-                                                   "toShardName" << toShard.getName() <<
-                                                   "min" << min <<
-                                                   "max" << max <<
-                                                   "shardKeyPattern" << shardKeyPattern <<
-                                                   "configServer" << configServer.modelServer() <<
-                                                   "secondaryThrottle" << secondaryThrottle
-                                             ) ,
-                                             res );
+                    ok = connTo->runCommand("admin", recvChunkStartBuilder.done(), res);
                 }
                 catch( DBException& e ){
                     errmsg = str::stream() << "moveChunk could not contact to: shard "
@@ -1387,6 +1448,12 @@ namespace mongo {
 
                     ScopedDbConnection conn(shardingState.getConfigServer(), 10.0);
                     ok = conn->runCommand( "config" , cmd , cmdResult );
+
+                    if (MONGO_FAIL_POINT(failMigrationApplyOps)) {
+                        throw SocketException(SocketException::RECV_ERROR,
+                                              shardingState.getConfigServer());
+                    }
+
                     conn.done();
                 }
                 catch ( DBException& e ) {
@@ -1445,9 +1512,8 @@ namespace mongo {
                                                     Query(BSON(ChunkType::ns(ns)))
                                                         .sort(BSON(ChunkType::DEPRECATED_lastmod() << -1)));
 
-                        ChunkVersion checkVersion =
-                            ChunkVersion::fromBSON(doc[ChunkType::DEPRECATED_lastmod()]);
 
+                        ChunkVersion checkVersion(ChunkVersion::fromBSON(doc));
                         if ( checkVersion.equals( nextVersion ) ) {
                             log() << "moveChunk commit confirmed" << migrateLog;
                             errmsg.clear();
@@ -1498,7 +1564,7 @@ namespace mongo {
                                         min.getOwned(),
                                         max.getOwned(),
                                         shardKeyPattern.getOwned(),
-                                        secondaryThrottle,
+                                        writeConcern,
                                         &errMsg)) {
                     log() << "Error occured while performing cleanup: " << errMsg << endl;
                 }
@@ -1511,7 +1577,7 @@ namespace mongo {
                                           min.getOwned(),
                                           max.getOwned(),
                                           shardKeyPattern.getOwned(),
-                                          secondaryThrottle,
+                                          writeConcern,
                                           NULL, // Don't want to be notified.
                                           &errMsg)) {
                     log() << "could not queue migration cleanup: " << errMsg << endl;
@@ -1671,6 +1737,7 @@ namespace mongo {
                         db->createCollection( txn, ns );
                     }
                 }
+                ctx.commit();
             }
 
             {                
@@ -1710,6 +1777,7 @@ namespace mongo {
                     // make sure to create index on secondaries as well
                     repl::logOp(txn, "i", db->getSystemIndexesName().c_str(), idx,
                                    NULL, NULL, true /* fromMigrate */);
+                    ctx.commit();
                 }
 
                 timing.done(1);
@@ -1723,7 +1791,7 @@ namespace mongo {
                 long long num = Helpers::removeRange( txn,
                                                       range,
                                                       false, /*maxInclusive*/
-                                                      secondaryThrottle, /* secondaryThrottle */
+                                                      writeConcern,
                                                       /*callback*/
                                                       serverGlobalParams.moveParanoia ? &rs : 0,
                                                       true ); /* flag fromMigrate in oplog */
@@ -1755,7 +1823,7 @@ namespace mongo {
             State currentState = getState();
             if (currentState == FAIL || currentState == ABORT) {
                 string errMsg;
-                if (!getDeleter()->queueDelete(ns, min, max, shardKeyPattern, secondaryThrottle,
+                if (!getDeleter()->queueDelete(ns, min, max, shardKeyPattern, writeConcern,
                                                NULL /* notifier */, &errMsg)) {
                     warning() << "Failed to queue delete for migrate abort: " << errMsg << endl;
                 }
@@ -1809,23 +1877,21 @@ namespace mongo {
                             }
 
                             Helpers::upsert( txn, ns, o, true );
+                            cx.commit();
                         }
                         thisTime++;
                         numCloned++;
                         clonedBytes += o.objsize();
 
-                        if ( secondaryThrottle && thisTime > 0 ) {
-                            WriteConcernOptions writeConcern;
-                            writeConcern.wNumNodes = 2;
-                            writeConcern.wTimeout = 60 * 1000;
+                        if (writeConcern.shouldWaitForOtherNodes() && thisTime > 0) {
                             repl::ReplicationCoordinator::StatusAndDuration replStatus =
                                     repl::getGlobalReplicationCoordinator()->awaitReplication(
                                             txn,
                                             cc().getLastOp(),
                                             writeConcern);
                             if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
-                                    warning() << "secondaryThrottle on, but doc insert timed out "
-                                                 "after 60 seconds, continuing";
+                                warning() << "secondaryThrottle on, but doc insert timed out; "
+                                             "continuing";
                             }
                             else {
                                 massertStatusOK(replStatus.status);
@@ -2038,14 +2104,17 @@ namespace mongo {
 
                     // TODO: create a better interface to remove objects directly
                     KeyRange range( ns, id, id, idIndexPattern );
+                    const WriteConcernOptions singleNodeWrite(1, WriteConcernOptions::NONE,
+                            WriteConcernOptions::kNoTimeout);
                     Helpers::removeRange( txn,
                                           range ,
                                           true , /*maxInclusive*/
-                                          false , /* secondaryThrottle */
+                                          singleNodeWrite,
                                           serverGlobalParams.moveParanoia ? &rs : 0 , /*callback*/
                                           true ); /*fromMigrate*/
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
+                    cx.commit();
                     didAnything = true;
                 }
             }
@@ -2075,6 +2144,7 @@ namespace mongo {
                     Helpers::upsert( txn, ns , it , true );
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
+                    cx.commit();
                     didAnything = true;
                 }
             }
@@ -2204,7 +2274,7 @@ namespace mongo {
         long long clonedBytes;
         long long numCatchup;
         long long numSteady;
-        bool secondaryThrottle;
+        WriteConcernOptions writeConcern;
 
         int replSetMajorityCount;
 
@@ -2230,6 +2300,25 @@ namespace mongo {
         cc().shutdown();
     }
 
+    /**
+     * Command for initiating the recipient side of the migration to start copying data
+     * from the donor shard.
+     *
+     * {
+     *   _recvChunkStart: "namespace",
+     *   congfigServer: "hostAndPort",
+     *   from: "hostAndPort",
+     *   fromShardName: "shardName",
+     *   toShardName: "shardName",
+     *   min: {},
+     *   max: {},
+     *   shardKeyPattern: {},
+     *
+     *   // optional
+     *   secondaryThrottle: bool, // defaults to true
+     *   writeConcern: {} // applies to individual writes.
+     * }
+     */
     class RecvChunkStartCommand : public ChunkCommandHelper {
     public:
         void help(stringstream& h) const { h << "internal"; }
@@ -2280,7 +2369,7 @@ namespace mongo {
             // We force the remote refresh here to make the behavior consistent and predictable,
             // generally we'd refresh anyway, and to be paranoid.
             ChunkVersion currentVersion;
-            Status status = shardingState.refreshMetadataNow( ns, &currentVersion );
+            Status status = shardingState.refreshMetadataNow(txn, ns, &currentVersion );
 
             if ( !status.isOK() ) {
                 errmsg = str::stream() << "cannot start recv'ing chunk "
@@ -2296,7 +2385,37 @@ namespace mongo {
             migrateStatus.min = min;
             migrateStatus.max = max;
             migrateStatus.epoch = currentVersion.epoch();
-            migrateStatus.secondaryThrottle = cmdObj["secondaryThrottle"].trueValue();
+
+            // Process secondary throttle settings and assign defaults if necessary.
+            WriteConcernOptions writeConcern;
+            status = writeConcern.parseSecondaryThrottle(cmdObj, NULL);
+
+            if (!status.isOK()){
+                if (status.code() != ErrorCodes::WriteConcernNotDefined) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
+                }
+
+                writeConcern = getDefaultWriteConcern();
+            }
+            else {
+                repl::ReplicationCoordinator* replCoordinator =
+                        repl::getGlobalReplicationCoordinator();
+                Status status = replCoordinator->checkIfWriteConcernCanBeSatisfied(writeConcern);
+                if (!status.isOK()) {
+                    warning() << status.toString() << endl;
+                    return appendCommandStatus(result, status);
+                }
+            }
+
+            if (writeConcern.shouldWaitForOtherNodes() &&
+                    writeConcern.wTimeout == WriteConcernOptions::kNoTimeout) {
+                // Don't allow no timeout.
+                writeConcern.wTimeout = kDefaultWTimeoutMs;
+            }
+
+            migrateStatus.writeConcern = writeConcern;
+
             if (cmdObj.hasField("shardKeyPattern")) {
                 migrateStatus.shardKeyPattern = cmdObj["shardKeyPattern"].Obj().getOwned();
             } else {
@@ -2313,12 +2432,6 @@ namespace mongo {
                     " chunk range specifiers.  Inferred shard key: " << keya << endl;
 
                 migrateStatus.shardKeyPattern = keya.getOwned();
-            }
-
-            if (migrateStatus.secondaryThrottle &&
-                    !repl::getGlobalReplicationCoordinator()->isReplEnabled()) {
-                warning() << "secondaryThrottle asked for, but no replication is enabled" << endl;
-                migrateStatus.secondaryThrottle = false;
             }
 
             // Set the TO-side migration to active
