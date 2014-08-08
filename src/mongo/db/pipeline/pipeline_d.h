@@ -1,5 +1,5 @@
 /**
- * Copyright 2012 (c) 10gen Inc.
+ * Copyright (C) 2012-2014 MongoDB Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -34,8 +34,9 @@ namespace mongo {
     class Collection;
     class DocumentSourceCursor;
     struct ExpressionContext;
+    class OperationContext;
     class Pipeline;
-    class Runner;
+    class PlanExecutor;
 
     /*
       PipelineD is an extension of the Pipeline class, but with additional
@@ -64,13 +65,14 @@ namespace mongo {
          *
          * Must have a ReadContext before entering.
          *
-         * If the returned Runner is non-null, you are responsible for ensuring
+         * If the returned PlanExecutor is non-null, you are responsible for ensuring
          * it receives appropriate invalidate and kill messages.
          *
          * @param pPipeline the logical "this" for this operation
          * @param pExpCtx the expression context for this pipeline
          */
-        static boost::shared_ptr<Runner> prepareCursorSource(
+        static boost::shared_ptr<PlanExecutor> prepareCursorSource(
+            OperationContext* txn,
             Collection* collection,
             const intrusive_ptr<Pipeline> &pPipeline,
             const intrusive_ptr<ExpressionContext> &pExpCtx);

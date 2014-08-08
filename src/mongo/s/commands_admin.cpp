@@ -26,7 +26,7 @@
 *    then also delete it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
 
@@ -45,9 +45,11 @@
 #include "mongo/db/hasher.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/query/lite_parsed_query.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/cluster_write.h"
@@ -59,10 +61,10 @@
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_database.h"
 #include "mongo/s/type_shard.h"
-#include "mongo/s/writeback_listener.h"
 #include "mongo/s/write_ops/batch_downconvert.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/processinfo.h"
@@ -72,6 +74,8 @@
 #include "mongo/util/version.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     namespace dbgrid_cmds {
 
@@ -769,8 +773,9 @@ namespace mongo {
                             continue;
 
                         BSONObj moveResult;
+                        WriteConcernOptions noThrottle;
                         if (!chunk->moveAndCommit(to, Chunk::MaxChunkSize,
-                                false, true, 0, moveResult)) {
+                                                  &noThrottle, true, 0, moveResult)) {
                             warning().stream()
                                       << "Couldn't move chunk " << chunk << " to shard "  << to
                                       << " while sharding collection " << ns << ". Reason: "
@@ -793,7 +798,7 @@ namespace mongo {
                         if ( i == allSplits.size() ||
                                 ! currentChunk->containsPoint( allSplits[i] ) ) {
                             if ( ! subSplits.empty() ){
-                                Status status = currentChunk->multiSplit( subSplits );
+                                Status status = currentChunk->multiSplit(subSplits, NULL);
                                 if ( !status.isOK() ){
                                     warning().stream()
                                         << "Couldn't split chunk " << currentChunk
@@ -998,8 +1003,9 @@ namespace mongo {
 
                 BSONObj res;
                 if ( middle.isEmpty() ) {
-                    Status status = chunk->split( true /* force a split even if not enough data */,
-                                                  NULL );
+                    Status status = chunk->split(true /* force a split even if not enough data */,
+                                                 NULL,
+                                                 NULL);
                     if ( !status.isOK() ) {
                         errmsg = "split failed";
                         result.append( "cause", status.toString() );
@@ -1020,7 +1026,7 @@ namespace mongo {
 
                     vector<BSONObj> splitPoints;
                     splitPoints.push_back( middle );
-                    Status status = chunk->multiSplit( splitPoints );
+                    Status status = chunk->multiSplit(splitPoints, NULL);
 
                     if ( !status.isOK() ) {
                         errmsg = "split failed";
@@ -1130,10 +1136,23 @@ namespace mongo {
                     return false;
                 }
 
+                scoped_ptr<WriteConcernOptions> writeConcern(new WriteConcernOptions());
+                Status status = writeConcern->parseSecondaryThrottle(cmdObj, NULL);
+
+                if (!status.isOK()){
+                    if (status.code() != ErrorCodes::WriteConcernNotDefined) {
+                        errmsg = status.toString();
+                        return false;
+                    }
+
+                    // Let the shard decide what write concern to use.
+                    writeConcern.reset();
+                }
+
                 BSONObj res;
                 if (!c->moveAndCommit(to,
                                       maxChunkSizeBytes,
-                                      cmdObj["_secondaryThrottle"].trueValue(),
+                                      writeConcern.get(),
                                       cmdObj["_waitForDelete"].trueValue(),
                                       maxTimeMS.getValue(),
                                       res)) {
@@ -1221,7 +1240,8 @@ namespace mongo {
 
                     // it's fine if mongods of a set all use default port
                     if ( ! serverAddrs[i].hasPort() ) {
-                        serverAddrs[i].setPort(ServerGlobalParams::ShardServerPort);
+                        serverAddrs[i] = HostAndPort(serverAddrs[i].host(),
+                                                     ServerGlobalParams::ShardServerPort);
                     }
                 }
 
@@ -1495,7 +1515,7 @@ namespace mongo {
                 help << "{whatsmyuri:1}";
             }
             virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-                result << "you" << ClientInfo::get()->getRemote();
+                result << "you" << ClientInfo::get()->getRemote().toString();
                 return true;
             }
         } cmdWhatsMyUri;

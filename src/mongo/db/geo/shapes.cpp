@@ -26,9 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/geo/core.h"
 #include "mongo/db/geo/shapes.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -444,11 +442,36 @@ namespace mongo {
 
     bool R2Annulus::fastDisjoint(const Box& other) const {
         return !circleIntersectsWithBox(Circle(_outer, _center), other)
-            || circleInteriorContainsBox(Circle(_inner, _center), other);
+               || circleInteriorContainsBox(Circle(_inner, _center), other);
     }
 
+    string R2Annulus::toString() const {
+        return str::stream() << "center: " << _center.toString() << " inner: " << _inner
+                             << " outer: " << _outer;
+    }
 
     /////// Other methods
+
+    double S2Distance::distanceRad(const S2Point& pointA, const S2Point& pointB) {
+        S1Angle angle(pointA, pointB);
+        return angle.radians();
+    }
+
+    double S2Distance::minDistanceRad(const S2Point& point, const S2Polyline& line) {
+        int tmp;
+        S1Angle angle(point, line.Project(point, &tmp));
+        return angle.radians();
+    }
+
+    double S2Distance::minDistanceRad(const S2Point& point, const S2Polygon& polygon) {
+        S1Angle angle(point, polygon.Project(point));
+        return angle.radians();
+    }
+
+    double S2Distance::minDistanceRad(const S2Point& point, const S2Cap& cap) {
+        S1Angle angleToCenter(point, cap.axis());
+        return (angleToCenter - cap.angle()).radians();
+    }
 
     /**
      * Distance method that compares x or y coords when other direction is zero,
@@ -506,16 +529,6 @@ namespace mongo {
         return sqrt((a * a) + (b * b)) - radius;
     }
 
-    // Technically lat/long bounds, not really tied to earth radius.
-    void checkEarthBounds(const Point &p) {
-        uassert(14808, str::stream() << "point " << p.toString()
-                                     << " must be in earth-like bounds of long "
-                                     << ": [-180, 180], lat : [-90, 90] ",
-                p.x >= -180 && p.x <= 180 && p.y >= -90 && p.y <= 90);
-    }
-
-
-    // WARNING: x and y MUST be longitude and latitude in that order
     // note: multiply by earth radius for distance
     double spheredist_rad(const Point& p1, const Point& p2) {
         // this uses the n-vector formula: http://en.wikipedia.org/wiki/N-vector
@@ -547,6 +560,11 @@ namespace mongo {
     double spheredist_deg(const Point& p1, const Point& p2) {
         return spheredist_rad(Point(deg2rad(p1.x), deg2rad(p1.y)),
                               Point(deg2rad(p2.x), deg2rad(p2.y)));
+    }
+
+    // Technically lat/long bounds, not really tied to earth radius.
+    bool isValidLngLat(double lng, double lat) {
+        return abs(lng) <= 180 && abs(lat) <= 90;
     }
 
     double distance(const Point& p1, const Point &p2) {
@@ -600,6 +618,10 @@ namespace mongo {
     static bool circleContainsBoxInternal(const Circle& circle,
                                           const Box& box,
                                           bool includeCircleBoundary) {
+
+        // NOTE: a circle of zero radius is a point, and there are NO points contained inside a
+        // zero-radius circle, not even the point itself.
+
         const Point& a = box._min;
         const Point& b = box._max;
         double compareLL = distanceCompare( circle.center, a, circle.radius ); // Lower left
@@ -628,6 +650,12 @@ namespace mongo {
     static bool circleIntersectsWithBoxInternal(const Circle& circle,
                                                 const Box& box,
                                                 bool includeCircleBoundary) {
+
+        // NOTE: a circle of zero radius is a point, and there are NO points to intersect inside a
+        // zero-radius circle, not even the point itself.
+        if (circle.radius == 0.0 && !includeCircleBoundary)
+            return false;
+
         /* Collapses the four quadrants down into one.
          *   ________
          * r|___B___ \  <- a quarter round corner here. Let's name it "D".
@@ -717,6 +745,46 @@ namespace mongo {
         // 3. Otherwise they intersect on a portion of both shapes.
         // Edges intersects
         return edgesIntersectsWithBox(polygon.points(), box);
+    }
+
+    bool ShapeProjection::supportsProject(const PointWithCRS& point, const CRS crs) {
+
+        // Can always trivially project or project from SPHERE->FLAT
+        if (point.crs == crs || point.crs == SPHERE)
+            return true;
+
+        invariant(point.crs == FLAT);
+        // If crs is FLAT, we might be able to upgrade the point to SPHERE if it's a valid SPHERE
+        // point (lng/lat in bounds).  In this case, we can use FLAT data with SPHERE predicates.
+        return isValidLngLat(point.oldPoint.x, point.oldPoint.y);
+    }
+
+    void ShapeProjection::projectInto(PointWithCRS* point, CRS crs) {
+        dassert(supportsProject(*point, crs));
+
+        if (point->crs == crs)
+            return;
+
+        if (FLAT == point->crs) {
+            invariant(SPHERE == crs);
+
+            // Note that it's (lat, lng) for S2 but (lng, lat) for MongoDB.
+            S2LatLng latLng =
+                S2LatLng::FromDegrees(point->oldPoint.y, point->oldPoint.x).Normalized();
+            dassert(latLng.is_valid());
+            point->point = latLng.ToPoint();
+            point->cell = S2Cell(point->point);
+            point->crs = SPHERE;
+        }
+        else {
+            invariant(SPHERE == point->crs);
+            invariant(FLAT == crs);
+
+            // Just remove the additional spherical information
+            point->point = S2Point();
+            point->cell = S2Cell();
+            point->crs = FLAT;
+        }
     }
 
 }  // namespace mongo

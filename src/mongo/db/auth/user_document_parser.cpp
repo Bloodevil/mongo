@@ -45,11 +45,12 @@ namespace {
 
     const std::string ROLES_FIELD_NAME = "roles";
     const std::string PRIVILEGES_FIELD_NAME = "inheritedPrivileges";
+    const std::string INHERITED_ROLES_FIELD_NAME = "inheritedRoles";
     const std::string OTHER_DB_ROLES_FIELD_NAME = "otherDBRoles";
     const std::string READONLY_FIELD_NAME = "readOnly";
     const std::string CREDENTIALS_FIELD_NAME = "credentials";
     const std::string ROLE_NAME_FIELD_NAME = "role";
-    const std::string ROLE_SOURCE_FIELD_NAME = "db";
+    const std::string ROLE_DB_FIELD_NAME = "db";
     const std::string MONGODB_CR_CREDENTIAL_FIELD_NAME = "MONGODB-CR";
     const std::string SCRAM_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-1";
     const std::string MONGODB_EXTERNAL_CREDENTIAL_FIELD_NAME = "external";
@@ -62,10 +63,6 @@ namespace {
         return Status(ErrorCodes::BadValue, reason, location);
     }
 
-    inline StringData makeStringDataFromBSONElement(const BSONElement& element) {
-        return StringData(element.valuestr(), element.valuestrsize() - 1);
-    }
-
     Status _checkV1RolesArray(const BSONElement& rolesElement) {
         if (rolesElement.type() != Array) {
             return _badValue("Role fields must be an array when present in system.users entries",
@@ -73,7 +70,7 @@ namespace {
         }
         for (BSONObjIterator iter(rolesElement.embeddedObject()); iter.more(); iter.next()) {
             BSONElement element = *iter;
-            if (element.type() != String || makeStringDataFromBSONElement(element).empty()) {
+            if (element.type() != String || element.valueStringData().empty()) {
                 return _badValue("Roles must be non-empty strings.", 0);
             }
         }
@@ -236,15 +233,14 @@ namespace {
         // Validate the "user" element.
         if (userElement.type() != String)
             return _badValue("User document needs 'user' field to be a string", 0);
-        if (makeStringDataFromBSONElement(userElement).empty())
+        if (userElement.valueStringData().empty())
             return _badValue("User document needs 'user' field to be non-empty", 0);
 
         // Validate the "db" element
-        if (userDBElement.type() != String ||
-                makeStringDataFromBSONElement(userDBElement).empty()) {
+        if (userDBElement.type() != String || userDBElement.valueStringData().empty()) {
             return _badValue("User document needs 'db' field to be a non-empty string", 0);
         }
-        StringData userDBStr = makeStringDataFromBSONElement(userDBElement);
+        StringData userDBStr = userDBElement.valueStringData();
         if (!NamespaceString::validDBName(userDBStr) && userDBStr != "$external") {
             return _badValue(mongoutils::str::stream() << "'" << userDBStr <<
                                      "' is not a valid value for the db field.",
@@ -278,8 +274,7 @@ namespace {
             BSONElement mongoCRElement = credentialsObj[MONGODB_CR_CREDENTIAL_FIELD_NAME];
             
             if (!mongoCRElement.eoo()) {
-                if (mongoCRElement.type() != String ||
-                    makeStringDataFromBSONElement(mongoCRElement).empty()) {
+                if (mongoCRElement.type() != String || mongoCRElement.valueStringData().empty()) {
                     return _badValue("MONGODB-CR credential must to be a non-empty string"
                                      ", if present", 0);
                 }
@@ -373,7 +368,7 @@ namespace {
                 
                 if (!mongoCRCredentialElement.eoo()) {
                     if (mongoCRCredentialElement.type() != String ||
-                            makeStringDataFromBSONElement(mongoCRCredentialElement).empty()) {
+                            mongoCRCredentialElement.valueStringData().empty()) {
                         return Status(ErrorCodes::UnsupportedFormat,
                                       "MONGODB-CR credentials must be non-empty strings");
                     } else {
@@ -402,15 +397,13 @@ namespace {
             BSONElement* roleSourceElement) {
 
         *roleNameElement = roleObject[ROLE_NAME_FIELD_NAME];
-        *roleSourceElement = roleObject[ROLE_SOURCE_FIELD_NAME];
+        *roleSourceElement = roleObject[ROLE_DB_FIELD_NAME];
 
-        if (roleNameElement->type() != String ||
-                makeStringDataFromBSONElement(*roleNameElement).empty()) {
+        if (roleNameElement->type() != String || roleNameElement->valueStringData().empty()) {
             return Status(ErrorCodes::UnsupportedFormat,
                           "Role names must be non-empty strings");
         }
-        if (roleSourceElement->type() != String ||
-                makeStringDataFromBSONElement(*roleSourceElement).empty()) {
+        if (roleSourceElement->type() != String || roleSourceElement->valueStringData().empty()) {
             return Status(ErrorCodes::UnsupportedFormat, "Role db must be non-empty strings");
         }
 
@@ -482,6 +475,36 @@ namespace {
             roles.push_back(role);
         }
         user->setRoles(makeRoleNameIteratorForContainer(roles));
+        return Status::OK();
+    }
+
+    Status V2UserDocumentParser::initializeUserIndirectRolesFromUserDocument(
+            const BSONObj& privDoc, User* user) const {
+
+        BSONElement indirectRolesElement = privDoc[INHERITED_ROLES_FIELD_NAME];
+
+        if (indirectRolesElement.type() != Array) {
+            return Status(ErrorCodes::UnsupportedFormat,
+                          "User document needs 'inheritedRoles' field to be an array");
+        }
+
+        std::vector<RoleName> indirectRoles;
+        for (BSONObjIterator it(indirectRolesElement.Obj()); it.more(); it.next()) {
+            if ((*it).type() != Object) {
+                return Status(ErrorCodes::UnsupportedFormat,
+                              "User document needs values in 'inheritedRoles'"
+                              " array to be a sub-documents");
+            }
+            BSONObj indirectRoleObject = (*it).Obj();
+
+            RoleName indirectRole;
+            Status status = parseRoleName(indirectRoleObject, &indirectRole);
+            if (!status.isOK()) {
+                return status;
+            }
+            indirectRoles.push_back(indirectRole);
+        }
+        user->setIndirectRoles(makeRoleNameIteratorForContainer(indirectRoles));
         return Status::OK();
     }
 

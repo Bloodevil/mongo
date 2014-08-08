@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/auth/authz_manager_external_state_d.h"
 
 #include <boost/thread/mutex.hpp>
@@ -37,14 +39,18 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kAccessControl);
 
     AuthzManagerExternalStateMongod::AuthzManagerExternalStateMongod() {}
     AuthzManagerExternalStateMongod::~AuthzManagerExternalStateMongod() {}
@@ -85,12 +91,13 @@ namespace mongo {
     }
 
     Status AuthzManagerExternalStateMongod::query(
+            OperationContext* txn,
             const NamespaceString& collectionName,
             const BSONObj& query,
             const BSONObj& projection,
             const stdx::function<void(const BSONObj&)>& resultProcessor) {
         try {
-            DBDirectClient client;
+            DBDirectClient client(txn);
             client.query(resultProcessor, collectionName.ns(), query, &projection);
             return Status::OK();
         } catch (const DBException& e) {
@@ -100,7 +107,8 @@ namespace mongo {
 
     Status AuthzManagerExternalStateMongod::getAllDatabaseNames(
                 OperationContext* txn, std::vector<std::string>* dbnames) {
-        globalStorageEngine->listDatabases( dbnames );
+        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        storageEngine->listDatabases(dbnames);
         return Status::OK();
     }
 

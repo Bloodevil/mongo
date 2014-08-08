@@ -29,12 +29,12 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <boost/thread.hpp>
 
-#include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/d_concurrency.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
@@ -46,6 +46,7 @@
 #include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/concurrency/qlock.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/log.h"
 #include "mongo/server.h"
 
 namespace mongo { 
@@ -53,6 +54,8 @@ namespace mongo {
 }
 
 namespace ThreadedTests {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     template <int nthreads_param=10>
     class ThreadedTest {
@@ -109,7 +112,9 @@ namespace ThreadedTests {
                 // in _DEBUG builds on linux we mprotect each time a writelock
                 // is taken. That can greatly slow down this test if there are
                 // many open files
-                DBDirectClient db;
+                OperationContextImpl txn;
+                DBDirectClient db(&txn);
+
                 db.simpleCommand("admin", NULL, "closeAllDatabases");
             }
 
@@ -217,6 +222,7 @@ namespace ThreadedTests {
                             }
                             {
                                 Lock::DBWrite x(&lockState, "local");
+                                //  No actual writing here, so no WriteUnitOfWork
                                 if( sometimes ) {
                                     Lock::TempRelease t(&lockState);
                                 }
@@ -293,36 +299,6 @@ namespace ThreadedTests {
                 LockState ls;
                 Lock::GlobalRead r(&ls);
             }
-        }
-    };
-
-    // Tested with up to 30k threads
-    class IsAtomicUIntAtomic : public ThreadedTest<> {
-        static const int iterations = 1000000;
-        AtomicUInt target;
-
-        void subthread(int) {
-            for(int i=0; i < iterations; i++) {
-                //target.x++; // verified to fail with this version
-                target++;
-            }
-        }
-        void validate() {
-            ASSERT_EQUALS(target.x , unsigned(nthreads * iterations));
-
-            AtomicUInt u;
-            ASSERT_EQUALS(0u, u);
-            ASSERT_EQUALS(0u, u++);
-            ASSERT_EQUALS(2u, ++u);
-            ASSERT_EQUALS(2u, u--);
-            ASSERT_EQUALS(0u, --u);
-            ASSERT_EQUALS(0u, u);
-            
-            u++;
-            ASSERT( u > 0 );
-
-            u--;
-            ASSERT( ! ( u > 0 ) );
         }
     };
 
@@ -1027,7 +1003,6 @@ namespace ThreadedTests {
             add< List1Test >();
             add< List1Test2 >();
 
-            add< IsAtomicUIntAtomic >();
             add< IsAtomicWordAtomic<AtomicUInt32> >();
             add< IsAtomicWordAtomic<AtomicUInt64> >();
             add< MVarTest >();

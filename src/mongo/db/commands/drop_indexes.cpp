@@ -28,20 +28,25 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/background.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
     class CmdDropIndexes : public Command {
@@ -95,11 +100,17 @@ namespace mongo {
         CmdDropIndexes() : Command("dropIndexes", false, "deleteIndexes") { }
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& anObjBuilder, bool fromRepl) {
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            WriteUnitOfWork wunit(txn->recoveryUnit());
             bool ok = wrappedRun(txn, dbname, jsobj, errmsg, anObjBuilder);
-            if (ok && !fromRepl)
+            if (!ok) {
+                return false;
+            }
+            if (!fromRepl)
                 repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
-            return ok;
+            wunit.commit();
+            return true;
         }
+
         bool wrappedRun(OperationContext* txn,
                         const string& dbname,
                         BSONObj& jsobj,
@@ -111,7 +122,7 @@ namespace mongo {
                 LOG(0) << "CMD: dropIndexes " << toDeleteNs << endl;
             }
 
-            Client::Context ctx(toDeleteNs);
+            Client::Context ctx(txn, toDeleteNs);
             Database* db = ctx.db();
 
             Collection* collection = db->getCollection( txn, toDeleteNs );
@@ -215,7 +226,7 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
-            DBDirectClient db;
+            DBDirectClient db(txn);
 
             BSONElement e = jsobj.firstElement();
             string toDeleteNs = dbname + '.' + e.valuestr();
@@ -223,7 +234,8 @@ namespace mongo {
             LOG(0) << "CMD: reIndex " << toDeleteNs << endl;
 
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(toDeleteNs);
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context ctx(txn, toDeleteNs);
 
             Collection* collection = ctx.db()->getCollection( txn, toDeleteNs );
 
@@ -236,24 +248,18 @@ namespace mongo {
 
             std::vector<BSONObj> indexesInProg = stopIndexBuilds(txn, ctx.db(), jsobj);
 
-            list<BSONObj> all;
-            auto_ptr<DBClientCursor> i = db.query( dbname + ".system.indexes" , BSON( "ns" << toDeleteNs ) , 0 , 0 , 0 , QueryOption_SlaveOk );
-            BSONObjBuilder b;
-            while ( i->more() ) {
-                const BSONObj spec = i->next().removeField("v").getOwned();
-                const BSONObj key = spec.getObjectField("key");
-                const Status keyStatus = validateKeyPattern(key);
-                if (!keyStatus.isOK()) {
-                    errmsg = str::stream()
-                        << "Cannot rebuild index " << spec << ": " << keyStatus.reason()
-                        << " For more info see http://dochub.mongodb.org/core/index-validation";
-                    return false;
+            vector<BSONObj> all;
+            {
+                vector<string> indexNames;
+                collection->getCatalogEntry()->getAllIndexes( &indexNames );
+                for ( size_t i = 0; i < indexNames.size(); i++ ) {
+                    const string& name = indexNames[i];
+                    BSONObj spec = collection->getCatalogEntry()->getIndexSpec( name );
+                    all.push_back( spec.getOwned() );
                 }
-
-                b.append( BSONObjBuilder::numStr( all.size() ) , spec );
-                all.push_back( spec );
             }
-            result.appendNumber( "nIndexesWas", collection->getIndexCatalog()->numIndexesTotal() );
+
+            result.appendNumber( "nIndexesWas", all.size() );
 
             Status s = collection->getIndexCatalog()->dropAllIndexes(txn, true);
             if ( !s.isOK() ) {
@@ -261,18 +267,19 @@ namespace mongo {
                 return appendCommandStatus( result, s );
             }
 
-            for ( list<BSONObj>::iterator i=all.begin(); i!=all.end(); i++ ) {
-                BSONObj o = *i;
+            for ( size_t i = 0; i < all.size(); i++ ) {
+                BSONObj o = all[i];
                 LOG(1) << "reIndex ns: " << toDeleteNs << " index: " << o << endl;
                 Status s = collection->getIndexCatalog()->createIndex(txn, o, false);
                 if ( !s.isOK() )
                     return appendCommandStatus( result, s );
             }
 
-            result.append( "nIndexes" , (int)all.size() );
-            result.appendArray( "indexes" , b.obj() );
+            result.append( "nIndexes", (int)all.size() );
+            result.append( "indexes", all );
 
             IndexBuilder::restoreIndexes(indexesInProg);
+            wunit.commit();
             return true;
         }
     } cmdReIndex;

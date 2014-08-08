@@ -46,6 +46,7 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/sync_tail.h"
@@ -57,16 +58,6 @@
 
 namespace mongo {
 namespace repl {
-
-    using namespace bson;
-
-    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(maxSyncSourceLagSecs, int, 30);
-    MONGO_INITIALIZER(maxSyncSourceLagSecsCheck) (InitializerContext*) {
-        if (maxSyncSourceLagSecs < 1) {
-            return Status(ErrorCodes::BadValue, "maxSyncSourceLagSecs must be > 0");
-        }
-        return Status::OK();
-    }
 
     /* should be in RECOVERING state on arrival here.
        readlocks
@@ -95,7 +86,7 @@ namespace repl {
             return false;
         }
 
-        minvalid = getMinValid();
+        minvalid = getMinValid(txn);
         if( minvalid <= lastOpTimeWritten ) {
             golive=true;
         }
@@ -112,21 +103,18 @@ namespace repl {
     }
 
 
-    bool ReplSetImpl::forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result) {
+    Status ReplSetImpl::forceSyncFrom(const string& host, BSONObjBuilder* result) {
         lock lk(this);
 
         // initial sanity check
         if (iAmArbiterOnly()) {
-            errmsg = "arbiters don't sync";
-            return false;
+            return Status(ErrorCodes::NotSecondary, "arbiters don't sync");
         }
         if (box.getState().primary()) {
-            errmsg = "primaries don't sync";
-            return false;
+            return Status(ErrorCodes::NotSecondary, "primaries don't sync");
         }
         if (_self != NULL && host == _self->fullName()) {
-            errmsg = "I cannot sync from myself";
-            return false;
+            return Status(ErrorCodes::InvalidOptions, "I cannot sync from myself");
         }
 
         // find the member we want to sync from
@@ -142,43 +130,40 @@ namespace repl {
         if (!newTarget) {
             // this will also catch if someone tries to sync a member from itself, as _self is not
             // included in the _members list.
-            errmsg = "could not find member in replica set";
-            return false;
+            return Status(ErrorCodes::NodeNotFound, "could not find member in replica set");
         }
         if (newTarget->config().arbiterOnly) {
-            errmsg = "I cannot sync from an arbiter";
-            return false;
+            return Status(ErrorCodes::InvalidOptions, "I cannot sync from an arbiter");
         }
         if (!newTarget->config().buildIndexes && myConfig().buildIndexes) {
-            errmsg = "I cannot sync from a member who does not build indexes";
-            return false;
+            return Status(ErrorCodes::InvalidOptions,
+                          "I cannot sync from a member who does not build indexes");
         }
         if (newTarget->hbinfo().authIssue) {
-            errmsg = "I cannot authenticate against the requested member";
-            return false;
+            return Status(ErrorCodes::Unauthorized,
+                          "not authorized to communicate with " + newTarget->fullName());
         }
         if (newTarget->hbinfo().health == 0) {
-            errmsg = "I cannot reach the requested member";
-            return false;
+            return Status(ErrorCodes::HostUnreachable, "I cannot reach the requested member");
         }
         if (newTarget->hbinfo().opTime.getSecs()+10 < lastOpTimeWritten.getSecs()) {
             log() << "attempting to sync from " << newTarget->fullName()
                   << ", but its latest opTime is " << newTarget->hbinfo().opTime.getSecs()
                   << " and ours is " << lastOpTimeWritten.getSecs() << " so this may not work"
                   << rsLog;
-            result.append("warning", "requested member is more than 10 seconds behind us");
+            result->append("warning", "requested member is more than 10 seconds behind us");
             // not returning false, just warning
         }
 
         // record the previous member we were syncing from
         const Member *prev = BackgroundSync::get()->getSyncTarget();
         if (prev) {
-            result.append("prevSyncTarget", prev->fullName());
+            result->append("prevSyncTarget", prev->fullName());
         }
 
         // finally, set the new target
         _forceSyncTarget = newTarget;
-        return true;
+        return Status::OK();
     }
 
     bool ReplSetImpl::gotForceSync() {
@@ -231,12 +216,12 @@ namespace repl {
         tail.oplogApplication();
     }
 
-    bool ReplSetImpl::resync(string& errmsg) {
+    bool ReplSetImpl::resync(OperationContext* txn, string& errmsg) {
         changeState(MemberState::RS_RECOVERING);
 
-        Client::Context ctx("local");
-        OperationContextImpl txn;
-        ctx.db()->dropCollection(&txn, "local.oplog.rs");
+        Client::Context ctx(txn, "local");
+
+        ctx.db()->dropCollection(txn, "local.oplog.rs");
         {
             boost::unique_lock<boost::mutex> lock(theReplSet->initialSyncMutex);
             theReplSet->initialSyncRequested = true;

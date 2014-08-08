@@ -30,12 +30,19 @@
 
 #pragma once
 
+#include <map>
+
+#include <boost/thread/mutex.hpp>
+
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
+    class MMAPV1DatabaseCatalogEntry;
+
     class MMAPV1Engine : public StorageEngine {
     public:
+        MMAPV1Engine();
         virtual ~MMAPV1Engine();
 
         RecoveryUnit* newRecoveryUnit( OperationContext* opCtx );
@@ -50,8 +57,20 @@ namespace mongo {
         DatabaseCatalogEntry* getDatabaseCatalogEntry( OperationContext* opCtx,
                                                        const StringData& db );
 
+        Status closeDatabase(OperationContext* txn, const StringData& db );
+
+        Status dropDatabase(OperationContext* txn, const StringData& db );
+
+        void cleanShutdown(OperationContext* txn);
+
     private:
         static void _listDatabases( const std::string& directory,
                                     std::vector<std::string>* out );
+
+        boost::mutex _entryMapMutex;
+        typedef std::map<std::string,MMAPV1DatabaseCatalogEntry*> EntryMap;
+        EntryMap _entryMap;
     };
+
+    void _deleteDataFiles(const std::string& database);
 }

@@ -40,8 +40,15 @@
 namespace mongo {
 
     OperationContextImpl::OperationContextImpl() {
-        invariant( globalStorageEngine );
-        _recovery.reset(globalStorageEngine->newRecoveryUnit(this));
+        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        invariant(storageEngine);
+        _recovery.reset(storageEngine->newRecoveryUnit(this));
+
+        getGlobalEnvironment()->registerOperationContext(this);
+    }
+
+    OperationContextImpl::~OperationContextImpl() {
+        getGlobalEnvironment()->unregisterOperationContext(this);
     }
 
     RecoveryUnit* OperationContextImpl::recoveryUnit() const {
@@ -49,8 +56,7 @@ namespace mongo {
     }
 
     LockState* OperationContextImpl::lockState() const {
-        // TODO: This will eventually become member of OperationContextImpl
-        return &cc().lockState();
+        return const_cast<LockState*>(&_lockState);
     }
 
     ProgressMeter* OperationContextImpl::setMessage(const char * msg,
@@ -60,8 +66,16 @@ namespace mongo {
         return &getCurOp()->setMessage(msg, name, progressMeterTotal, secondsBetween);
     }
 
-    const char* OperationContextImpl::getNS() const {
+    string OperationContextImpl::getNS() const {
         return getCurOp()->getNS();
+    }
+
+    bool OperationContextImpl::isGod() const {
+        return cc().isGod();
+    }
+
+    Client* OperationContextImpl::getClient() const {
+        return &cc();
     }
 
     CurOp* OperationContextImpl::getCurOp() const {
@@ -132,7 +146,7 @@ namespace mongo {
         MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
             if (opShouldFail(c, scopedFailPoint.getData())) {
                 log() << "set pending kill on " << (c.curop()->parent() ? "nested" : "top-level")
-                      << " op " << c.curop()->opNum().get() << ", for checkForInterruptFail";
+                      << " op " << c.curop()->opNum() << ", for checkForInterruptFail";
                 c.curop()->kill();
             }
         }
@@ -157,7 +171,7 @@ namespace mongo {
         MONGO_FAIL_POINT_BLOCK(checkForInterruptFail, scopedFailPoint) {
             if (opShouldFail(c, scopedFailPoint.getData())) {
                 log() << "set pending kill on " << (c.curop()->parent() ? "nested" : "top-level")
-                      << " op " << c.curop()->opNum().get() << ", for checkForInterruptFail";
+                      << " op " << c.curop()->opNum() << ", for checkForInterruptFail";
                 c.curop()->kill();
             }
         }
@@ -172,6 +186,10 @@ namespace mongo {
     bool OperationContextImpl::isPrimaryFor( const StringData& ns ) {
         return repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
                 NamespaceString(ns).db());
+    }
+
+    Transaction* OperationContextImpl::getTransaction() {
+        return _tx.setTxIdOnce((unsigned)getCurOp()->opNum());
     }
 
 }  // namespace mongo

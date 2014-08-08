@@ -32,14 +32,14 @@
 
 #pragma once
 
-#include "mongo/pch.h"
-
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
 #include "mongo/client/export_macros.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
 
@@ -320,7 +320,7 @@ namespace mongo {
         static ConnectionString mock( const HostAndPort& server ) {
             ConnectionString connStr;
             connStr._servers.push_back( server );
-            connStr._string = server.toString( true );
+            connStr._string = server.toString();
             return connStr;
         }
 
@@ -932,9 +932,18 @@ namespace mongo {
         std::list<std::string> getDatabaseNames();
 
         /**
-           get a list of all the current collections in db
+         * Get a list of all the current collections in db.
+         * Returns fully qualified names.
          */
         std::list<std::string> getCollectionNames( const std::string& db );
+
+        /**
+         * { name : "<short collection name>",
+         *   options : { }
+         * }
+         */
+        std::list<BSONObj> getCollectionInfos( const std::string& db,
+                                               const BSONObj& filter = BSONObj() );
 
         bool exists( const std::string& ns );
 
@@ -965,7 +974,12 @@ namespace mongo {
          */
         virtual void resetIndexCache();
 
+        /**
+         * @deprecated use getIndexSpecs
+         */
         virtual std::auto_ptr<DBClientCursor> getIndexes( const std::string &ns );
+
+        virtual std::list<BSONObj> getIndexSpecs( const std::string &ns, int options = 0 );
 
         virtual void dropIndex( const std::string& ns , BSONObj keys );
         virtual void dropIndex( const std::string& ns , const std::string& indexName );
@@ -1189,6 +1203,8 @@ namespace mongo {
             return INVALID_SOCK_CREATION_TIME;
         }
 
+        virtual void reset() {}
+
     }; // DBClientBase
 
     class DBClientReplicaSet;
@@ -1376,8 +1392,6 @@ namespace mongo {
     /** pings server to check if it's up
      */
     MONGO_CLIENT_API bool serverAlive( const std::string &uri );
-
-    MONGO_CLIENT_API DBClientBase * createDirectClient();
 
     MONGO_CLIENT_API BSONElement getErrField( const BSONObj& result );
     MONGO_CLIENT_API bool hasErrField( const BSONObj& result );

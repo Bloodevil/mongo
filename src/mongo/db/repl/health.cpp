@@ -52,8 +52,7 @@ namespace repl {
     ScopedConn::M& ScopedConn::_map = *(new ScopedConn::M());
     mutex ScopedConn::mapMutex("ScopedConn::mapMutex");
 
-    using namespace mongoutils::html;
-    using namespace bson;
+    using namespace html;
 
     static RamLog * _rsLog = RamLog::get("rs");
     Tee* rsLog = _rsLog;
@@ -459,7 +458,7 @@ namespace repl {
         const Member *syncTarget = BackgroundSync::get()->getSyncTarget();
         if ( syncTarget &&
             (myState != MemberState::RS_PRIMARY) &&
-            (myState != MemberState::RS_SHUNNED) ) {
+            (myState != MemberState::RS_REMOVED) ) {
             b.append("syncingTo", syncTarget->fullName());
         }
         b.append("members", v);

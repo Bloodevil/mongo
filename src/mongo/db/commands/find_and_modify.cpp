@@ -1,7 +1,7 @@
 // find_and_modify.cpp
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands/find_and_modify.h"
 
@@ -40,10 +40,13 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     /* Find and Modify an object returning either the old (default) or new value*/
     class CmdFindAndModify : public Command {
@@ -94,7 +97,7 @@ namespace mongo {
             }
 
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(ns);
+            Client::Context ctx(txn, ns);
             
             return runNoDirectClient( txn, ns , 
                                       query , fields , update , 
@@ -134,10 +137,12 @@ namespace mongo {
                                       string& errmsg) {
 
             Lock::DBWrite lk(txn->lockState(), ns);
-            Client::Context cx( ns );
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context cx(txn, ns);
+            
             Collection* collection = cx.db()->getCollection( txn, ns );
 
-            const WhereCallbackReal whereCallback = WhereCallbackReal(StringData(ns));
+            const WhereCallbackReal whereCallback = WhereCallbackReal(txn, StringData(ns));
 
             BSONObj doc;
             bool found = false;
@@ -146,17 +151,18 @@ namespace mongo {
                 massert(17383, "Could not canonicalize " + queryOriginal.toString(),
                     CanonicalQuery::canonicalize(ns, queryOriginal, &cq, whereCallback).isOK());
 
-                Runner* rawRunner;
-                massert(17384, "Could not get runner for query " + queryOriginal.toString(),
-                        getRunner(collection, cq, &rawRunner, QueryPlannerParams::DEFAULT).isOK());
+                PlanExecutor* rawExec;
+                massert(17384, "Could not get plan executor for query " + queryOriginal.toString(),
+                        getExecutor(txn, collection, cq, &rawExec, QueryPlannerParams::DEFAULT).isOK());
 
-                auto_ptr<Runner> runner(rawRunner);
+                auto_ptr<PlanExecutor> exec(rawExec);
 
-                // Set up automatic yielding
-                const ScopedRunnerRegistration safety(runner.get());
+                // We need to keep this PlanExecutor registration: we are concurrently modifying
+                // state and may continue doing that with document-level locking (approach is TBD).
+                const ScopedExecutorRegistration safety(exec.get());
 
-                Runner::RunnerState state;
-                if (Runner::RUNNER_ADVANCED == (state = runner->getNext(&doc, NULL))) {
+                PlanExecutor::ExecState state;
+                if (PlanExecutor::ADVANCED == (state = exec->getNext(&doc, NULL))) {
                     found = true;
                 }
             }
@@ -242,7 +248,7 @@ namespace mongo {
                     }
                     
                     const NamespaceString requestNs(ns);
-                    UpdateRequest request(requestNs);
+                    UpdateRequest request(txn, requestNs);
 
                     request.setQuery(queryModified);
                     request.setUpdates(update);
@@ -252,8 +258,7 @@ namespace mongo {
                     // the shard version below, but for now no
                     UpdateLifecycleImpl updateLifecycle(false, requestNs);
                     request.setLifecycle(&updateLifecycle);
-                    UpdateResult res = mongo::update(txn,
-                                                     cx.db(),
+                    UpdateResult res = mongo::update(cx.db(),
                                                      request,
                                                      &txn->getCurOp()->debug());
 
@@ -297,7 +302,7 @@ namespace mongo {
                     
                 }
             }
-            
+            wunit.commit();
             return true;
         }
         
@@ -323,14 +328,15 @@ namespace mongo {
 
             Projection projection;
             if (fields) {
-                projection.init(fieldsHolder, WhereCallbackReal(StringData(dbname)));
+                projection.init(fieldsHolder, WhereCallbackReal(txn, StringData(dbname)));
                 if (!projection.includeID()) {
                     fields = NULL; // do projection in post-processing
                 }
             }
 
             Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(ns);
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+            Client::Context ctx(txn, ns);
 
             BSONObj out = db.findOne(ns, q, fields);
             if (out.isEmpty()) {
@@ -423,9 +429,9 @@ namespace mongo {
 
             result.append("value", out);
 
+            wunit.commit();
             return true;
         }
     } cmdFindAndModify;
-
 
 }

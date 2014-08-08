@@ -30,7 +30,8 @@
 
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 
-#include "mongo/db/catalog/database.h"
+#include <utility>
+
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/2d_access_method.h"
 #include "mongo/db/index/btree_access_method.h"
@@ -41,16 +42,66 @@
 #include "mongo/db/index/s2_access_method.h"
 #include "mongo/db/pdfile_version.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/storage/mmap_v1/btree/btree_interface.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
 #include "mongo/db/storage/mmap_v1/data_file.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/structure/catalog/namespace_details_collection_entry.h"
-#include "mongo/db/structure/catalog/namespace_details_rsv1_metadata.h"
-#include "mongo/db/structure/record_store_v1_capped.h"
-#include "mongo/db/structure/record_store_v1_simple.h"
+#include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_simple.h"
 
 namespace mongo {
 
     MONGO_EXPORT_SERVER_PARAMETER(newCollectionsUsePowerOf2Sizes, bool, true);
+
+    /**
+     * Registers the insertion of a new entry in the _collections cache with the RecoveryUnit,
+     * allowing for rollback.
+     */
+    class MMAPV1DatabaseCatalogEntry::EntryInsertion : public RecoveryUnit::Change {
+    public:
+        EntryInsertion(const StringData& ns, MMAPV1DatabaseCatalogEntry* entry)
+            : _ns(ns.toString()), _entry(entry) { }
+
+        void rollback() {
+            _entry->_removeFromCache(NULL, _ns);
+        }
+
+        void commit() { }
+    private:
+        std::string _ns;
+        MMAPV1DatabaseCatalogEntry* const _entry;
+    };
+
+    /**
+     * Registers the removal of an entry from the _collections cache with the RecoveryUnit,
+     * delaying actual deletion of the information until the change is commited. This allows
+     * for easy rollback.
+     */
+    class MMAPV1DatabaseCatalogEntry::EntryRemoval : public RecoveryUnit::Change {
+    public:
+        //  Rollback removing the collection from the cache. Takes ownership of the cachedEntry,
+        //  and will delete it if removal is final.
+        EntryRemoval(const StringData& ns,
+                     MMAPV1DatabaseCatalogEntry* catalogEntry,
+                     Entry *cachedEntry)
+            : _ns(ns.toString()), _catalogEntry(catalogEntry), _cachedEntry(cachedEntry) { }
+
+        void rollback() {
+            boost::mutex::scoped_lock lk(_catalogEntry->_collectionsLock);
+            _catalogEntry->_collections[_ns] = _cachedEntry;
+        }
+
+        void commit() {
+            delete _cachedEntry;
+        }
+
+    private:
+        std::string _ns;
+        MMAPV1DatabaseCatalogEntry* const _catalogEntry;
+        Entry* const _cachedEntry;
+    };
 
     MMAPV1DatabaseCatalogEntry::MMAPV1DatabaseCatalogEntry( OperationContext* txn,
                                                             const StringData& name,
@@ -63,9 +114,6 @@ namespace mongo {
           _namespaceIndex( _path, name.toString() ) {
 
         try {
-            if ( !transient )
-                _checkDuplicateUncasedNames();
-
             Status s = _extentManager.init(txn);
             if ( !s.isOK() ) {
                 msgasserted( 16966, str::stream() << "_extentManager.init failed: " << s.toString() );
@@ -100,7 +148,7 @@ namespace mongo {
                     Entry*& entry = _collections[ns];
                     if ( !entry ) {
                         entry = new Entry();
-                        _fillInEntry_inlock( txn, ns, entry );
+                        _insertInCache_inlock(txn, ns, entry);
                     }
                 }
             }
@@ -117,8 +165,6 @@ namespace mongo {
             _extentManager.reset();
             throw;
         }
-
-
     }
 
     MMAPV1DatabaseCatalogEntry::~MMAPV1DatabaseCatalogEntry() {
@@ -130,18 +176,26 @@ namespace mongo {
         _collections.clear();
     }
 
-    void MMAPV1DatabaseCatalogEntry::_removeFromCache( const StringData& ns ) {
-        boost::mutex::scoped_lock lk( _collectionsLock );
-        CollectionMap::iterator i = _collections.find( ns.toString() );
+    void MMAPV1DatabaseCatalogEntry::_removeFromCache(RecoveryUnit* ru,
+                                                      const StringData& ns) {
+        boost::mutex::scoped_lock lk(_collectionsLock);
+        CollectionMap::iterator i = _collections.find(ns.toString());
         if ( i == _collections.end() )
             return;
-        delete i->second;
-        _collections.erase( i );
+
+        //  If there is an operation context, register a rollback to restore the cache entry
+        if (ru) {
+            ru->registerChange(new EntryRemoval(ns, this, i->second));
+        }
+        else {
+            delete i->second;
+        }
+        _collections.erase(i);
     }
 
-    Status MMAPV1DatabaseCatalogEntry::dropCollection( OperationContext* txn, const StringData& ns ) {
-        invariant( txn->lockState()->isWriteLocked( ns ) );
-        _removeFromCache( ns );
+    Status MMAPV1DatabaseCatalogEntry::dropCollection(OperationContext* txn, const StringData& ns) {
+        invariant(txn->lockState()->isWriteLocked(ns));
+        _removeFromCache(txn->recoveryUnit(), ns);
 
         NamespaceDetails* details = _namespaceIndex.details( ns );
 
@@ -180,7 +234,7 @@ namespace mongo {
         invariant( details );
 
         RecordStoreV1Base* systemIndexRecordStore = _getIndexRecordStore();
-        scoped_ptr<RecordIterator> it( systemIndexRecordStore->getIterator() );
+        scoped_ptr<RecordIterator> it( systemIndexRecordStore->getIterator(txn) );
 
         while ( !it->isEOF() ) {
             DiskLoc loc = it->getNext();
@@ -206,7 +260,7 @@ namespace mongo {
                 systemIndexRecordStore->insertRecord( txn,
                                                       newIndexSpec.objdata(),
                                                       newIndexSpec.objsize(),
-                                                      -1 );
+                                                      false );
             if ( !newIndexSpecLoc.isOK() )
                 return newIndexSpecLoc.getStatus();
 
@@ -252,7 +306,7 @@ namespace mongo {
         if ( _namespaceIndex.details( toNS ) )
             return Status( ErrorCodes::BadValue, "to namespace already exists" );
 
-        _removeFromCache( fromNS );
+        _removeFromCache(txn->recoveryUnit(), fromNS);
 
         // at this point, we haven't done anything destructive yet
 
@@ -289,7 +343,7 @@ namespace mongo {
             BSONObj oldSpec;
             {
                 RecordStoreV1Base* rs = _getNamespaceRecordStore();
-                scoped_ptr<RecordIterator> it( rs->getIterator() );
+                scoped_ptr<RecordIterator> it( rs->getIterator(txn) );
                 while ( !it->isEOF() ) {
                     DiskLoc loc = it->getNext();
                     BSONObj entry = it->dataFor( loc ).toBson();
@@ -326,7 +380,7 @@ namespace mongo {
         Entry*& entry = _collections[toNS.toString()];
         invariant( entry == NULL );
         entry = new Entry();
-        _fillInEntry_inlock( txn, toNS, entry );
+        _insertInCache_inlock(txn, toNS, entry);
 
         return Status::OK();
     }
@@ -413,16 +467,6 @@ namespace mongo {
         _namespaceIndex.getCollectionNamespaces( tofill );
     }
 
-    void MMAPV1DatabaseCatalogEntry::_checkDuplicateUncasedNames() const {
-        string duplicate = Database::duplicateUncasedName(name());
-        if ( !duplicate.empty() ) {
-            stringstream ss;
-            ss << "db already exists with different case already have: [" << duplicate
-               << "] trying to create [" << name() << "]";
-            uasserted( DatabaseDifferCaseCode , ss.str() );
-        }
-    }
-
     namespace {
         int _massageExtentSize( const ExtentManager* em, long long size ) {
             if ( size < em->minSize() )
@@ -444,7 +488,7 @@ namespace mongo {
 
     void MMAPV1DatabaseCatalogEntry::_lazyInit( OperationContext* txn ) {
         // this is sort of insane
-        // it's because the whole structure is highly recursive
+        // it's because the whole storage/mmap_v1 is highly recursive
 
         _namespaceIndex.init( txn );
 
@@ -481,8 +525,8 @@ namespace mongo {
                                                                  &_extentManager,
                                                                  false ) );
 
-            if ( nsEntry->recordStore->storageSize() == 0 )
-                nsEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+            if ( nsEntry->recordStore->storageSize( txn ) == 0 )
+                nsEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), false );
         }
 
         if ( !indexEntry ) {
@@ -497,8 +541,8 @@ namespace mongo {
                                                                     &_extentManager,
                                                                     true ) );
 
-            if ( indexEntry->recordStore->storageSize() == 0 )
-                indexEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+            if ( indexEntry->recordStore->storageSize( txn ) == 0 )
+                indexEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), false );
         }
 
         if ( isSystemIndexesGoingToBeNew ) {
@@ -557,7 +601,7 @@ namespace mongo {
             Entry*& entry = _collections[ns.toString()];
             invariant( !entry );
             entry = new Entry();
-            _fillInEntry_inlock( txn, ns, entry );
+            _insertInCache_inlock(txn, ns, entry);
         }
 
         if ( allocateDefaultSpace ) {
@@ -565,14 +609,14 @@ namespace mongo {
             if ( options.initialNumExtents > 0 ) {
                 int size = _massageExtentSize( &_extentManager, options.cappedSize );
                 for ( int i = 0; i < options.initialNumExtents; i++ ) {
-                    rs->increaseStorageSize( txn, size, -1 );
+                    rs->increaseStorageSize( txn, size, false );
                 }
             }
             else if ( !options.initialExtentSizes.empty() ) {
                 for ( size_t i = 0; i < options.initialExtentSizes.size(); i++ ) {
                     int size = options.initialExtentSizes[i];
                     size = _massageExtentSize( &_extentManager, size );
-                    rs->increaseStorageSize( txn, size, -1 );
+                    rs->increaseStorageSize( txn, size, false );
                 }
             }
             else if ( options.capped ) {
@@ -581,13 +625,13 @@ namespace mongo {
                     // Must do this at least once, otherwise we leave the collection with no
                     // extents, which is invalid.
                     int sz = _massageExtentSize( &_extentManager,
-                                                 options.cappedSize - rs->storageSize() );
+                                                 options.cappedSize - rs->storageSize(txn) );
                     sz &= 0xffffff00;
-                    rs->increaseStorageSize( txn, sz, -1 );
-                } while( rs->storageSize() < options.cappedSize );
+                    rs->increaseStorageSize( txn, sz, false );
+                } while( rs->storageSize(txn) < options.cappedSize );
             }
             else {
-                rs->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+                rs->increaseStorageSize( txn, _extentManager.initialSize( 128 ), false );
             }
         }
 
@@ -595,7 +639,7 @@ namespace mongo {
     }
 
     CollectionCatalogEntry* MMAPV1DatabaseCatalogEntry::getCollectionCatalogEntry( OperationContext* txn,
-                                                                                  const StringData& ns ) {
+                                                                                  const StringData& ns ) const {
         boost::mutex::scoped_lock lk( _collectionsLock );
         CollectionMap::const_iterator i = _collections.find( ns.toString() );
         if ( i == _collections.end() )
@@ -605,11 +649,12 @@ namespace mongo {
         return i->second->catalogEntry.get();
     }
 
-    void MMAPV1DatabaseCatalogEntry::_fillInEntry_inlock( OperationContext* txn,
-                                                          const StringData& ns,
-                                                          Entry* entry ) {
-        NamespaceDetails* details = _namespaceIndex.details( ns );
-        invariant( details );
+    void MMAPV1DatabaseCatalogEntry::_insertInCache_inlock(OperationContext* txn,
+                                                         const StringData& ns,
+                                                         Entry* entry) {
+        txn->recoveryUnit()->registerChange(new EntryInsertion(ns, this));
+        NamespaceDetails* details = _namespaceIndex.details(ns);
+        invariant(details);
 
         entry->catalogEntry.reset( new NamespaceDetailsCollectionCatalogEntry( ns,
                                                                                details,
@@ -677,18 +722,18 @@ namespace mongo {
             Entry*& entry = _collections[ns];
             if ( !entry ) {
                 entry = new Entry();
-                _fillInEntry_inlock( txn, ns, entry );
+                _insertInCache_inlock(txn, ns, entry);
             }
             rs = entry->recordStore.get();
         }
 
-        std::auto_ptr<BtreeInterface> btree(
-            BtreeInterface::getInterface(entry->headManager(),
-                                         rs,
-                                         entry->ordering(),
-                                         entry->descriptor()->indexNamespace(),
-                                         entry->descriptor()->version(),
-                                         &BtreeBasedAccessMethod::invalidateCursors));
+        std::auto_ptr<SortedDataInterface> btree(
+            getMMAPV1Interface(entry->headManager(),
+                               rs,
+                               entry->ordering(),
+                               entry->descriptor()->indexNamespace(),
+                               entry->descriptor()->version(),
+                               &BtreeBasedAccessMethod::invalidateCursors));
 
         if (IndexNames::HASHED == type)
             return new HashAccessMethod( entry, btree.release() );
@@ -724,16 +769,16 @@ namespace mongo {
         return entry->recordStore.get();
     }
 
-    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore() {
+    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore() const {
         boost::mutex::scoped_lock lk( _collectionsLock );
         return _getNamespaceRecordStore_inlock();
     }
 
-    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore_inlock() {
+    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore_inlock() const {
         NamespaceString nss( name(), "system.namespaces" );
-        Entry* entry = _collections[nss.toString()];
-        invariant( entry );
-        return entry->recordStore.get();
+        CollectionMap::const_iterator i = _collections.find( nss.toString() );
+        invariant( i != _collections.end() );
+        return i->second->recordStore.get();
     }
 
     void MMAPV1DatabaseCatalogEntry::_addNamespaceToNamespaceCollection( OperationContext* txn,
@@ -759,7 +804,7 @@ namespace mongo {
 
         RecordStoreV1Base* rs = _getNamespaceRecordStore_inlock();
         invariant( rs );
-        StatusWith<DiskLoc> loc = rs->insertRecord( txn, obj.objdata(), obj.objsize(), -1 );
+        StatusWith<DiskLoc> loc = rs->insertRecord( txn, obj.objdata(), obj.objsize(), false );
         massertStatusOK( loc.getStatus() );
     }
 
@@ -773,7 +818,7 @@ namespace mongo {
         RecordStoreV1Base* rs = _getNamespaceRecordStore();
         invariant( rs );
 
-        scoped_ptr<RecordIterator> it( rs->getIterator() );
+        scoped_ptr<RecordIterator> it( rs->getIterator(txn) );
         while ( !it->isEOF() ) {
             DiskLoc loc = it->getNext();
             BSONObj entry = it->dataFor( loc ).toBson();
@@ -784,4 +829,31 @@ namespace mongo {
             }
         }
     }
-}
+
+    CollectionOptions MMAPV1DatabaseCatalogEntry::getCollectionOptions( OperationContext* txn,
+                                                                        const StringData& ns ) const {
+        if ( nsToCollectionSubstring( ns ) == "system.namespaces" ) {
+            return CollectionOptions();
+        }
+
+        RecordStoreV1Base* rs = _getNamespaceRecordStore();
+        invariant( rs );
+
+        scoped_ptr<RecordIterator> it( rs->getIterator(txn) );
+        while ( !it->isEOF() ) {
+            DiskLoc loc = it->getNext();
+            BSONObj entry = it->dataFor( loc ).toBson();
+            BSONElement name = entry["name"];
+            if ( name.type() == String && name.String() == ns ) {
+                CollectionOptions options;
+                if ( entry["options"].isABSONObj() ) {
+                    Status status = options.parse( entry["options"].Obj() );
+                    fassert( 18523, status );
+                }
+                return options;
+            }
+        }
+
+        return CollectionOptions();
+    }
+} // namespace mongo

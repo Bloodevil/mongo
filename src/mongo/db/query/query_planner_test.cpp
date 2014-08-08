@@ -1641,6 +1641,21 @@ namespace {
         runQuery(fromjson("{a: {$elemMatch: {$not: {$gte: 6}}}}"));
     }
 
+    // SERVER-14625: Make sure we construct bounds properly for $elemMatch object with a
+    // negation inside.
+    TEST_F(QueryPlannerTest, ElemMatchWithNotInside2) {
+        addIndex(BSON("a.b" << 1 << "a.c" << 1));
+        runQuery(fromjson("{d: 1, a: {$elemMatch: {c: {$ne: 3}, b: 4}}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {d: 1, a: {$elemMatch: {c: {$ne: 3}, b: 4}}}, node:"
+                                "{ixscan: {filter: null, pattern: {'a.b': 1, 'a.c': 1}, bounds:"
+                                    "{'a.b': [[4,4,true,true]],"
+                                    " 'a.c': [['MinKey',3,true,false],"
+                                             "[3,'MaxKey',false,true]]}}}}}");
+    }
+
     // SERVER-13789
     TEST_F(QueryPlannerTest, ElemMatchIndexedNestedOr) {
         addIndex(BSON("bar.baz" << 1));
@@ -1984,7 +1999,7 @@ namespace {
 
         // GEO_NEAR must use the index, and GEO predicate becomes a filter.
         assertNumSolutions(1U);
-        assertSolutionExists("{geoNear2d: {a: '2d'}}");
+        assertSolutionExists("{fetch: { node : { geoNear2d: {a: '2d'} } } }");
     }
 
     TEST_F(QueryPlannerTest, And2DSphereSameFieldNonNear) {
@@ -2141,7 +2156,8 @@ namespace {
         runQuery(fromjson("{a: {$near: [0, 0]}, b: {$gte: 0}}"));
 
         assertNumSolutions(1U);
-        assertSolutionExists("{geoNear2d: {a: '2d', b: 1}}");
+        assertSolutionExists("{fetch: { filter : {b:{$gte: 0}}, node: "
+                                 "{geoNear2d: {a: '2d', b: 1} } } }");
     }
 
     //
@@ -3035,6 +3051,15 @@ namespace {
         assertSolutionExists("{cscan: {dir: 1}}");
     }
 
+    // Negated $type doesn't use the index
+    TEST_F(QueryPlannerTest, NegationTypeOperator) {
+        addIndex(BSON("i" << 1));
+        runQuery(fromjson("{i: {$not: {$type: 16}}}"));
+
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+    }
+
     // Negated $elemMatch value won't use the index
     TEST_F(QueryPlannerTest, NegationElemMatchValue) {
         addIndex(BSON("i" << 1));
@@ -3220,7 +3245,7 @@ namespace {
         addIndex(BSON("a" << "2d"));
         runQuery(fromjson("{$and: [{a: {$near: [0, 0], $maxDistance: 0.3}}, {b: {$ne: 1}}]}"));
         assertNumSolutions(1U);
-        assertSolutionExists("{geoNear2d: {a: '2d'}}");
+        assertSolutionExists("{fetch: {node: { geoNear2d: {a: '2d'} } } }");
     }
 
     //

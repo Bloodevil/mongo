@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -36,22 +37,26 @@
 namespace mongo {
 namespace repl {
 
-    void parseReplSetSeedList(const std::string& cfgString,
+    class ReplicationCoordinatorExternalState;
+
+    void parseReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
+                              const std::string& cfgString,
                               std::string& setname,
-                              vector<HostAndPort>& seeds,
-                              set<HostAndPort>& seedSet);
+                              std::vector<HostAndPort>& seeds,
+                              std::set<HostAndPort>& seedSet);
 
     /** Parameter given to the --replSet command line option (parsed).
         Syntax is "<setname>/<seedhost1>,<seedhost2>"
         where setname is a name and seedhost is "<host>[:<port>]" */
     class ReplSetSeedList {
     public:
-        ReplSetSeedList(const std::string& cfgString) {
-            parseReplSetSeedList(cfgString, setname, seeds, seedSet);
+        ReplSetSeedList(ReplicationCoordinatorExternalState* externalState,
+                        const std::string& cfgString) {
+            parseReplSetSeedList(externalState, cfgString, setname, seeds, seedSet);
         }
         std::string setname;
-        vector<HostAndPort> seeds;
-        set<HostAndPort> seedSet;
+        std::vector<HostAndPort> seeds;
+        std::set<HostAndPort> seedSet;
     };
 
 } // namespace repl

@@ -31,9 +31,8 @@
 
 #pragma once
 
-#include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/client.h"
-#include "mongo/db/structure/catalog/namespace.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/progress_meter.h"
@@ -117,7 +116,7 @@ namespace mongo {
     /* lifespan is different than CurOp because of recursives with DBDirectClient */
     class OpDebug {
     public:
-        OpDebug() : ns(""), planSummary(2048) { reset(); }
+        OpDebug() : planSummary(2048) { reset(); }
 
         void reset();
 
@@ -147,7 +146,7 @@ namespace mongo {
         // basic options
         int op;
         bool iscommand;
-        Namespace ns;
+        ThreadSafeString ns;
         BSONObj query;
         BSONObj updateobj;
         
@@ -204,7 +203,7 @@ namespace mongo {
         void markCommand() { _isCommand = true; }
         OpDebug& debug()           { return _debug; }
         int profileLevel() const   { return _dbprofile; }
-        const char * getNS() const { return _ns; }
+        string getNS() const { return _ns.toString(); }
 
         bool shouldDBProfile( int ms ) const {
             if ( _dbprofile <= 0 )
@@ -213,7 +212,7 @@ namespace mongo {
             return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
         }
 
-        AtomicUInt opNum() const { return _opNum; }
+        unsigned int opNum() const { return _opNum; }
 
         /** if this op is running */
         bool active() const { return _active; }
@@ -283,12 +282,17 @@ namespace mongo {
         Command * getCommand() const { return _command; }
         void setCommand(Command* command) { _command = command; }
         
-        BSONObj info();
+        void reportState(BSONObjBuilder* builder);
 
         // Fetches less information than "info()"; used to search for ops with certain criteria
         BSONObj description();
 
-        std::string getRemoteString( bool includePort = true ) { return _remote.toString(includePort); }
+        std::string getRemoteString( bool includePort = true ) {
+            if (includePort)
+                return _remote.toString();
+            return _remote.host();
+        }
+
         ProgressMeter& setMessage(const char * msg,
                                   std::string name = "Progress",
                                   unsigned long long progressMeterTotal = 0,
@@ -305,7 +309,7 @@ namespace mongo {
         long long getExpectedLatencyMs() const { return _expectedLatencyMs; }
         void setExpectedLatencyMs( long long latency ) { _expectedLatencyMs = latency; }
 
-        void recordGlobalTime( long long micros ) const;
+        void recordGlobalTime(bool isWriteLocked, long long micros) const;
         
         const LockStat& lockStat() const { return _lockStat; }
         LockStat& lockStat() { return _lockStat; }
@@ -321,7 +325,7 @@ namespace mongo {
         friend class Client;
         void _reset();
 
-        static AtomicUInt _nextOpNum;
+        static AtomicUInt32 _nextOpNum;
         Client * _client;
         CurOp * _wrapped;
         Command * _command;
@@ -332,8 +336,8 @@ namespace mongo {
         int _op;
         bool _isCommand;
         int _dbprofile;                  // 0=off, 1=slow, 2=all
-        AtomicUInt _opNum;               // todo: simple being "unsigned" may make more sense here
-        char _ns[Namespace::MaxNsLen+2];
+        unsigned int _opNum;
+        ThreadSafeString _ns;
         HostAndPort _remote;             // CAREFUL here with thread safety
         CachedBSONObj<512> _query;       // CachedBSONObj is thread safe
         OpDebug _debug;

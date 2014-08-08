@@ -45,6 +45,9 @@ namespace mongo {
     PlanStage::StageState SkipStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         WorkingSetID id = WorkingSet::INVALID_ID;
         StageState status = _child->work(&id);
 
@@ -84,19 +87,25 @@ namespace mongo {
         }
     }
 
-    void SkipStage::prepareToYield() {
+    void SkipStage::saveState() {
         ++_commonStats.yields;
-        _child->prepareToYield();
+        _child->saveState();
     }
 
-    void SkipStage::recoverFromYield() {
+    void SkipStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
-        _child->recoverFromYield();
+        _child->restoreState(opCtx);
     }
 
     void SkipStage::invalidate(const DiskLoc& dl, InvalidationType type) {
         ++_commonStats.invalidates;
         _child->invalidate(dl, type);
+    }
+
+    vector<PlanStage*> SkipStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
     }
 
     PlanStageStats* SkipStage::getStats() {
@@ -106,6 +115,14 @@ namespace mongo {
         ret->specific.reset(new SkipStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* SkipStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* SkipStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

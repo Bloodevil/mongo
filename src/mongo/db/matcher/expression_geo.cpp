@@ -52,6 +52,12 @@ namespace mongo {
         if ( !geometry.parseFrom( e.Obj() ) )
                 return false;
 
+        // Project this geometry into the CRS of the query
+        if (!geometry.supportsProject(_query->getGeometry().getNativeCRS()))
+            return false;
+
+        geometry.projectInto(_query->getGeometry().getNativeCRS());
+
         if (GeoQuery::WITHIN == _query->getPred()) {
             return _query->getGeometry().contains(geometry);
         }
@@ -104,9 +110,9 @@ namespace mongo {
     // Parse-only geo expressions: geoNear (formerly known as near).
     //
 
-    Status GeoNearMatchExpression::init( const StringData& path, const NearQuery& query,
+    Status GeoNearMatchExpression::init( const StringData& path, const NearQuery* query,
                                          const BSONObj& rawObj ) {
-        _query = query;
+        _query.reset(query);
         _rawObj = rawObj;
         return initPath( path );
     }
@@ -120,7 +126,7 @@ namespace mongo {
 
     void GeoNearMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << "GEONEAR " << _query.toString();
+        debug << "GEONEAR " << _query->toString();
         MatchExpression::TagData* td = getTag();
         if (NULL != td) {
             debug << " ";
@@ -149,7 +155,8 @@ namespace mongo {
 
     LeafMatchExpression* GeoNearMatchExpression::shallowClone() const {
         GeoNearMatchExpression* next = new GeoNearMatchExpression();
-        next->init( path(), _query, _rawObj );
+        next->init( path(), NULL, _rawObj );
+        next->_query = _query;
         if (getTag()) {
             next->setTag(getTag()->clone());
         }

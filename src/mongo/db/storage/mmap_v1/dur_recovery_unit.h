@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#include <string>
+#include <boost/shared_ptr.hpp>
 #include <vector>
 
 #include "mongo/db/storage/recovery_unit.h"
@@ -59,14 +59,25 @@ namespace mongo {
 
         virtual void* writingPtr(void* data, size_t len);
 
+        //  The recovery unit takes ownership of change.
+        virtual void registerChange(Change* change);
+
         virtual void syncDataAndTruncateJournal();
 
     private:
         void recordPreimage(char* data, size_t len);
         void publishChanges();
-        void rollbackChanges();
-        void reset();
-        bool haveUncommitedChanges() { return !_changes.empty(); }
+        void rollbackInnermostChanges();
+
+        bool inAUnitOfWork() const { return !_startOfUncommittedChangesForLevel.empty(); }
+
+        bool inOutermostUnitOfWork() const {
+            return _startOfUncommittedChangesForLevel.size() == 1;
+        }
+
+        bool haveUncommitedChangesAtCurrentLevel() const {
+            return _changes.size() > _startOfUncommittedChangesForLevel.back();
+        }
 
         // The parent operation context. This pointer is not owned and it's lifetime must extend
         // past that of the DurRecoveryUnit
@@ -76,29 +87,22 @@ namespace mongo {
         // nesting.
         enum State {
             NORMAL, // anything is allowed
-            MUST_COMMIT, // can't rollback
-            MUST_ROLLBACK, // can't do anything else
+            MUST_COMMIT, // can't rollback (will go away once we have two-phase locking).
         };
         State _state;
-
-        // How many begins haven't had a matching end. TODO remove the need for this.
-        int _nestingLevel;
-
-        struct Change {
-            char* base;
-            std::string preimage; // TODO consider storing out-of-line
-        };
 
         // Changes are ordered from oldest to newest. Overlapping and duplicate regions are allowed,
         // since rollback undoes changes in reverse order.
         // TODO compare performance against a data-structure that coalesces overlapping/adjacent
         // changes.
-        typedef std::vector<Change> Changes;
+        typedef boost::shared_ptr<Change> ChangePtr;
+        typedef std::vector<ChangePtr> Changes;
         Changes _changes;
 
-        // XXX: this will be meaningful once killCurrentOp doesn't examine this bool's evil sibling
-        // in client.h.  This requires killCurrentOp to go through OperationContext...
-        bool _hasWrittenSinceCheckpoint;
+        // Index of the first uncommited change in _changes for each nesting level. Index 0 in this
+        // vector is always the outermost transaction and back() is always the innermost. The size()
+        // is the current nesting level.
+        std::vector<size_t> _startOfUncommittedChangesForLevel;
     };
 
 }  // namespace mongo

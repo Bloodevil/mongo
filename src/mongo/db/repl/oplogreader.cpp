@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/oplogreader.h"
 
 #include <boost/shared_ptr.hpp>
@@ -45,6 +47,9 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     //number of readers created;
@@ -66,11 +71,11 @@ namespace repl {
         return authenticateInternalUser(conn);
     }
 
-    bool replHandshake(DBClientConnection *conn, const BSONObj& me) {
+    bool replHandshake(DBClientConnection *conn, const OID& myRID) {
         string myname = getHostName();
 
         BSONObjBuilder cmd;
-        cmd.appendAs( me["_id"] , "handshake" );
+        cmd.append("handshake", myRID);
         if (theReplSet) {
             cmd.append("member", theReplSet->selfId());
             cmd.append("config", theReplSet->myConfig().asBson());
@@ -123,7 +128,7 @@ namespace repl {
         return true;
     }
 
-    bool OplogReader::connect(const std::string& hostName, const BSONObj& me) {
+    bool OplogReader::connect(const std::string& hostName, const OID& myRID) {
         if (conn()) {
             return true;
         }
@@ -132,7 +137,7 @@ namespace repl {
             return false;
         }
 
-        if (!replHandshake(_conn.get(), me)) {
+        if (!replHandshake(_conn.get(), myRID)) {
             return false;
         }
 

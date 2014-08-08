@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/index_builder.h"
 
 #include "mongo/db/client.h"
@@ -35,15 +37,18 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    AtomicUInt IndexBuilder::_indexBuildCount = 0;
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kIndexing);
+
+    AtomicUInt32 IndexBuilder::_indexBuildCount;
 
     IndexBuilder::IndexBuilder(const BSONObj& index) :
         BackgroundJob(true /* self-delete */), _index(index.getOwned()),
-        _name(str::stream() << "repl index builder " << (_indexBuildCount++).get()) {
+        _name(str::stream() << "repl index builder " << _indexBuildCount.addAndFetch(1)) {
     }
 
     IndexBuilder::~IndexBuilder() {}
@@ -72,6 +77,7 @@ namespace mongo {
         if ( !status.isOK() ) {
             log() << "IndexBuilder could not build index: " << status.toString();
         }
+        ctx.commit();
 
         cc().shutdown();
     }

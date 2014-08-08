@@ -36,6 +36,7 @@
 #include "mongo/base/init.h"
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/log_manager.h"
+#include "mongo/logger/logger.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/message_log_domain.h"
 #include "mongo/util/assert_util.h"
@@ -111,8 +112,13 @@ namespace mongo {
 
         Result* Result::cur = 0;
 
-        Test::Test() {}
-        Test::~Test() {}
+        Test::Test() : _isCapturingLogMessages(false) {}
+
+        Test::~Test() {
+            if (_isCapturingLogMessages) {
+                stopCapturingLogMessages();
+            }
+        }
 
         void Test::run() {
             setUp();
@@ -138,6 +144,40 @@ namespace mongo {
 
         void Test::setUp() {}
         void Test::tearDown() {}
+
+namespace {
+    class StringVectorAppender : public logger::MessageLogDomain::EventAppender {
+    public:
+        explicit StringVectorAppender(std::vector<std::string>* lines) : _lines(lines) {}
+        virtual ~StringVectorAppender() {}
+        virtual Status append(const logger::MessageLogDomain::Event& event) {
+            std::ostringstream _os;
+            if (!_encoder.encode(event, _os)) {
+                return Status(ErrorCodes::LogWriteFailed, "Failed to append to LogTestAppender.");
+            }
+            _lines->push_back(_os.str());
+            return Status::OK();
+        }
+    private:
+        logger::MessageEventDetailsEncoder _encoder;
+        std::vector<std::string>* _lines;
+    };
+}  // namespace
+
+        void Test::startCapturingLogMessages() {
+            invariant(!_isCapturingLogMessages);
+            _capturedLogMessages.clear();
+            _captureAppenderHandle = logger::globalLogDomain()->attachAppender(
+                    logger::MessageLogDomain::AppenderAutoPtr(new StringVectorAppender(
+                                                                      &_capturedLogMessages)));
+            _isCapturingLogMessages = true;
+        }
+
+        void Test::stopCapturingLogMessages() {
+            invariant(_isCapturingLogMessages);
+            logger::globalLogDomain()->detachAppender(_captureAppenderHandle);
+            _isCapturingLogMessages = false;
+        }
 
         Suite::Suite( const std::string& name ) : _name( name ) {
             registerSuite( name , this );
@@ -316,24 +356,35 @@ namespace mongo {
 
         void Suite::setupTests() {}
 
-        TestAssertionFailureDetails::TestAssertionFailureDetails(
-                const std::string& theFile,
-                unsigned theLine,
-                const std::string& theMessage )
-            : file( theFile ), line( theLine ), message( theMessage ) {
-        }
-
         TestAssertionFailureException::TestAssertionFailureException(
                 const std::string& theFile,
                 unsigned theLine,
                 const std::string& theFailingExpression )
-            : _details( new TestAssertionFailureDetails( theFile, theLine, theFailingExpression ) ) {
-        }
+            : _file(theFile), _line(theLine), _message(theFailingExpression) {}
 
         std::string TestAssertionFailureException::toString() const {
             std::ostringstream os;
             os << getMessage() << " @" << getFile() << ":" << getLine();
             return os.str();
+        }
+
+        TestAssertionFailure::TestAssertionFailure(const std::string& file,
+                                                   unsigned line,
+                                                   const std::string& message)
+            : _exception(file, line, message) {}
+
+        TestAssertionFailure::~TestAssertionFailure()
+#if __cplusplus >= 201103
+        noexcept(false)
+#endif
+        {
+            if (!_stream.str().empty())
+                _exception.setMessage(_exception.getMessage() + " " + _stream.str());
+            throw _exception;
+        }
+
+        std::ostream& TestAssertionFailure::stream() {
+            return _stream;
         }
 
         TestAssertion::TestAssertion( const char* file, unsigned line )

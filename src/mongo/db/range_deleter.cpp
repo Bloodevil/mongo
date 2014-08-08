@@ -38,6 +38,7 @@
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/range_arithmetic.h"
 #include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
@@ -93,6 +94,8 @@ namespace {
 }
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     namespace duration = boost::posix_time;
 
@@ -186,7 +189,7 @@ namespace mongo {
                                    const BSONObj& min,
                                    const BSONObj& max,
                                    const BSONObj& shardKeyPattern,
-                                   bool secondaryThrottle,
+                                   const WriteConcernOptions& writeConcern,
                                    Notification* notifyDone,
                                    std::string* errMsg) {
         string dummy;
@@ -196,7 +199,7 @@ namespace mongo {
                                                                  min.getOwned(),
                                                                  max.getOwned(),
                                                                  shardKeyPattern.getOwned(),
-                                                                 secondaryThrottle));
+                                                                 writeConcern));
         toDelete->notifyDone = notifyDone;
 
         {
@@ -240,10 +243,13 @@ namespace mongo {
     }
 
 namespace {
-    bool _waitForReplication(OperationContext* txn, std::string* errMsg) {
-        WriteConcernOptions writeConcern;
-        writeConcern.wMode = "majority";
-        writeConcern.wTimeout = 60 * 60 * 1000;
+    const int kWTimeoutMillis = 60 * 60 * 1000;
+
+    bool _waitForMajority(OperationContext* txn, std::string* errMsg) {
+        const WriteConcernOptions writeConcern("majority",
+                                               WriteConcernOptions::NONE,
+                                               kWTimeoutMillis);
+
         repl::ReplicationCoordinator::StatusAndDuration replStatus =
                 repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOp(txn,
                                                                                   writeConcern);
@@ -276,7 +282,7 @@ namespace {
                                  const BSONObj& min,
                                  const BSONObj& max,
                                  const BSONObj& shardKeyPattern,
-                                 bool secondaryThrottle,
+                                 const WriteConcernOptions& writeConcern,
                                  string* errMsg) {
         if (stopRequested()) {
             *errMsg = "deleter is already stopped.";
@@ -311,7 +317,7 @@ namespace {
                   << " cursors in " << ns << " to finish" << endl;
         }
 
-        RangeDeleteEntry taskDetails(ns, min, max, shardKeyPattern, secondaryThrottle);
+        RangeDeleteEntry taskDetails(ns, min, max, shardKeyPattern, writeConcern);
         taskDetails.stats.queueStartTS = jsTime();
 
         Date_t timeSinceLastLog;
@@ -370,7 +376,7 @@ namespace {
 
         if (result) {
             taskDetails.stats.waitForReplStartTS = jsTime();
-            result = _waitForReplication(txn, errMsg);
+            result = _waitForMajority(txn, errMsg);
             taskDetails.stats.waitForReplEndTS = jsTime();
         }
 
@@ -552,7 +558,7 @@ namespace {
                 if (delResult) {
                     nextTask->stats.waitForReplStartTS = jsTime();
 
-                    if (!_waitForReplication(txn.get(), &errMsg)) {
+                    if (!_waitForMajority(txn.get(), &errMsg)) {
                         warning() << "Error encountered while waiting for replication: " << errMsg;
                     }
 
@@ -659,12 +665,12 @@ namespace {
                                        const BSONObj& min,
                                        const BSONObj& max,
                                        const BSONObj& shardKey,
-                                       bool secondaryThrottle):
+                                       const WriteConcernOptions& writeConcern):
                                                ns(ns),
                                                min(min),
                                                max(max),
                                                shardKeyPattern(shardKey),
-                                               secondaryThrottle(secondaryThrottle),
+                                               writeConcern(writeConcern),
                                                notifyDone(NULL) {
     }
 

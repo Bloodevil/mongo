@@ -30,7 +30,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/geo/geoquery.h"
+#include "mongo/db/geo/geo_query.h"
 #include "mongo/db/fts/fts_query.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_cache.h"
@@ -564,7 +564,7 @@ namespace mongo {
 
     // This is a standalone stage.
     struct GeoNear2DNode : public QuerySolutionNode {
-        GeoNear2DNode() : numWanted(100), addPointMeta(false), addDistMeta(false) { }
+        GeoNear2DNode() : addPointMeta(false), addDistMeta(false) { }
         virtual ~GeoNear2DNode() { }
 
         virtual StageType getType() const { return STAGE_GEO_NEAR_2D; }
@@ -580,7 +580,8 @@ namespace mongo {
         BSONObjSet _sorts;
 
         NearQuery nq;
-        int numWanted;
+        IndexBounds baseBounds;
+
         BSONObj indexKeyPattern;
         bool addPointMeta;
         bool addDistMeta;

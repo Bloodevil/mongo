@@ -53,6 +53,9 @@ namespace mongo {
     PlanStage::StageState KeepMutationsStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         // If we've returned as many results as we're limited to, isEOF will be true.
         if (isEOF()) { return PlanStage::IS_EOF; }
 
@@ -100,19 +103,25 @@ namespace mongo {
         }
     }
 
-    void KeepMutationsStage::prepareToYield() {
+    void KeepMutationsStage::saveState() {
         ++_commonStats.yields;
-        _child->prepareToYield();
+        _child->saveState();
     }
 
-    void KeepMutationsStage::recoverFromYield() {
+    void KeepMutationsStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
-        _child->recoverFromYield();
+        _child->restoreState(opCtx);
     }
 
     void KeepMutationsStage::invalidate(const DiskLoc& dl, InvalidationType type) {
         ++_commonStats.invalidates;
         _child->invalidate(dl, type);
+    }
+
+    vector<PlanStage*> KeepMutationsStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
     }
 
     PlanStageStats* KeepMutationsStage::getStats() {
@@ -121,6 +130,14 @@ namespace mongo {
         // Takes ownership of the object returned from _child->getStats().
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* KeepMutationsStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* KeepMutationsStage::getSpecificStats() {
+        return NULL;
     }
 
 }  // namespace mongo

@@ -61,6 +61,9 @@ namespace mongo {
     PlanStage::StageState AndSortedStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         if (0 == _specificStats.failedAnd.size()) {
@@ -254,19 +257,19 @@ namespace mongo {
         }
     }
 
-    void AndSortedStage::prepareToYield() {
+    void AndSortedStage::saveState() {
         ++_commonStats.yields;
 
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->prepareToYield();
+            _children[i]->saveState();
         }
     }
 
-    void AndSortedStage::recoverFromYield() {
+    void AndSortedStage::restoreState(OperationContext* opCtx) {
         ++_commonStats.unyields;
 
         for (size_t i = 0; i < _children.size(); ++i) {
-            _children[i]->recoverFromYield();
+            _children[i]->restoreState(opCtx);
         }
     }
 
@@ -297,6 +300,10 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> AndSortedStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* AndSortedStage::getStats() {
         _commonStats.isEOF = isEOF();
 
@@ -314,6 +321,14 @@ namespace mongo {
         }
 
         return ret.release();
+    }
+
+    const CommonStats* AndSortedStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* AndSortedStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo
