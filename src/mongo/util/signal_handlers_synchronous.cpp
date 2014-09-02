@@ -45,6 +45,7 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit_code.h"
+#include "mongo/util/log.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/text.h"
 
@@ -134,14 +135,6 @@ namespace {
         ::_exit(EXIT_ABRUPT);
     }
 
-    // this gets called when new fails to allocate memory
-    void myNewHandler() {
-        boost::mutex::scoped_lock lk(streamMutex);
-        printStackTrace(mallocFreeOStream << "out of memory.\n");
-        writeMallocFreeStreamToLog();
-        ::_exit(EXIT_ABRUPT);
-    }
-
     void abruptQuit(int signalNum) {
         boost::mutex::scoped_lock lk(streamMutex);
         printSignalAndBacktrace(signalNum);
@@ -202,7 +195,7 @@ namespace {
 
     void setupSynchronousSignalHandlers() {
         std::set_terminate(myTerminate);
-        std::set_new_handler(myNewHandler);
+        std::set_new_handler(reportOutOfMemoryErrorAndExit);
 
         // SIGABRT is the only signal we want handled by signal handlers on both windows and posix.
         invariant(signal(SIGABRT, abruptQuit) != SIG_ERR);
@@ -229,5 +222,12 @@ namespace {
 
         setupSIGTRAPforGDB();
 #endif
+    }
+
+    void reportOutOfMemoryErrorAndExit() {
+        boost::mutex::scoped_lock lk(streamMutex);
+        printStackTrace(mallocFreeOStream << "out of memory.\n");
+        writeMallocFreeStreamToLog();
+        ::_exit(EXIT_ABRUPT);
     }
 }  // namespace mongo

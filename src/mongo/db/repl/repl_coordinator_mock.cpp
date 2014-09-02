@@ -40,9 +40,7 @@ namespace repl {
             _settings(settings) {}
     ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
-    void ReplicationCoordinatorMock::startReplication(
-            TopologyCoordinator* topCoord,
-            ReplicationExecutor::NetworkInterface* network) {
+    void ReplicationCoordinatorMock::startReplication(OperationContext* txn) {
         // TODO
     }
 
@@ -122,16 +120,19 @@ namespace repl {
     Status ReplicationCoordinatorMock::setLastOptime(OperationContext* txn,
                                                      const OID& rid,
                                                      const OpTime& ts) {
-        // TODO
         return Status::OK();
     }
     
+    Status ReplicationCoordinatorMock::setMyLastOptime(OperationContext* txn, const OpTime& ts) {
+        return Status::OK();
+    }
+
     OID ReplicationCoordinatorMock::getElectionId() {
         // TODO
         return OID();
     }
 
-    OID ReplicationCoordinatorMock::getMyRID(OperationContext* txn) {
+    OID ReplicationCoordinatorMock::getMyRID() {
         return OID();
     }
 
@@ -156,7 +157,7 @@ namespace repl {
         return false;
     }
 
-    Status ReplicationCoordinatorMock::processReplSetSyncFrom(const std::string& target,
+    Status ReplicationCoordinatorMock::processReplSetSyncFrom(const HostAndPort& target,
                                                               BSONObjBuilder* resultObj) {
         // TODO
         return Status::OK();

@@ -36,6 +36,8 @@
    local.pair.sync       - [deprecated] { initialsynccomplete: 1 }
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/master_slave.h"
@@ -62,8 +64,6 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
-
-    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
 
 namespace repl {
 
@@ -344,7 +344,8 @@ namespace repl {
             invariant(txn->lockState()->isW());
             Lock::TempRelease tempRelease(txn->lockState());
 
-            if (!oplogReader.connect(hostName, getGlobalReplicationCoordinator()->getMyRID(txn))) {
+            if (!oplogReader.connect(HostAndPort(hostName), 
+                                     getGlobalReplicationCoordinator()->getMyRID())) {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
             /* todo use getDatabaseNames() method here */
@@ -987,8 +988,6 @@ namespace repl {
                         break;
                     }
                     op = oplogReader.next();
-
-                    getDur().commitIfNeeded(txn);
                 }
             }
         }
@@ -1022,7 +1021,8 @@ namespace repl {
             return -1;
         }
 
-        if ( !oplogReader.connect(hostName, getGlobalReplicationCoordinator()->getMyRID(txn)) ) {
+        if ( !oplogReader.connect(HostAndPort(hostName), 
+                                  getGlobalReplicationCoordinator()->getMyRID()) ) {
             LOG(4) << "repl:  can't connect to sync source" << endl;
             return -1;
         }
