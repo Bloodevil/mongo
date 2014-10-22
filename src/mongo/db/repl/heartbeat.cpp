@@ -44,6 +44,7 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replset_commands.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/server.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/background.h"
@@ -73,12 +74,11 @@ namespace {
         if( names.size() == 1 ) {
             if( names[0] != "local" )
                 return true;
+
             // we have a local database.  return true if oplog isn't empty
-            {
-                Lock::DBRead lk(txn->lockState(), repl::rsoplog);
-                BSONObj o;
-                if( Helpers::getFirst(txn, repl::rsoplog, o) )
-                    return true;
+            BSONObj o;
+            if (Helpers::getSingleton(txn, repl::rsoplog, o)) {
+                return true;
             }
         }
         return false;
@@ -112,15 +112,10 @@ namespace {
                 return false;
             }
 
-            if ( replSetBlind ) {
-                errmsg = str::stream() << "node is blind";
-                return false;
-            }
-
             /* we want to keep heartbeat connections open when relinquishing primary.  
                tag them here. */
             {
-                AbstractMessagingPort *mp = cc().port();
+                AbstractMessagingPort *mp = txn->getClient()->port();
                 if( mp )
                     mp->tag |= ScopedConn::keepOpen;
             }
@@ -153,10 +148,6 @@ namespace {
                           int myCfgVersion,
                           int& theirCfgVersion,
                           bool checkEmpty) {
-        if( replSetBlind ) {
-            return false;
-        }
-
         MONGO_FAIL_POINT_BLOCK(rsStopHeartbeatRequest, member) {
             const BSONObj& data = member.getData();
             const std::string& stopMember = data["member"].str();
@@ -200,8 +191,6 @@ namespace {
         task::repeat(task, 2000);
     }
 
-    void startSyncThread();
-
     /** called during repl set startup.  caller expects it to return fairly quickly.
         note ReplSet object is only created once we get a config - so this won't run
         until the initiation.
@@ -213,13 +202,13 @@ namespace {
         if (myConfig().arbiterOnly) {
             return;
         }
-
+        
         // this ensures that will have bgsync's s_instance at all points where it is needed
         // so that we needn't check for its existence
         BackgroundSync* sync = BackgroundSync::get();
 
-        boost::thread t(startSyncThread);
-
+        boost::thread t(runSyncThread);
+                        
         boost::thread producer(stdx::bind(&BackgroundSync::producerThread, sync));
         boost::thread feedback(stdx::bind(&SyncSourceFeedback::run,
                                           &theReplSet->syncSourceFeedback));

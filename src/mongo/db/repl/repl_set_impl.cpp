@@ -41,28 +41,22 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/isself.h"
+#include "mongo/db/repl/minvalid.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/repl_set_seed_list.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_coordinator_hybrid.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/s/d_state.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 namespace repl {
-#ifdef MONGO_PLATFORM_64
-    const int ReplSetImpl::replWriterThreadCount = 16;
-    const int ReplSetImpl::replPrefetcherThreadCount = 16;
-#else
-    const int ReplSetImpl::replWriterThreadCount = 2;
-    const int ReplSetImpl::replPrefetcherThreadCount = 2;
-#endif
 
     void ReplSetImpl::sethbmsg(const std::string& s, int logLevel) {
         static time_t lastLogged;
@@ -97,7 +91,7 @@ namespace repl {
               << rsLog;
 
         // reset minvalid so that we can't become primary prematurely
-        setMinValid(txn, oldest);
+        setMinValid(txn, oldest["ts"]._opTime());
 
         sethbmsg("error RS102 too stale to catch up");
         changeState(MemberState::RS_RECOVERING);
@@ -149,37 +143,6 @@ namespace {
     }
 
     void ReplSetImpl::changeState(MemberState s) { box.change(s, _self); }
-
-    bool ReplSetImpl::setMaintenanceMode(OperationContext* txn, const bool inc) {
-        lock replLock(this);
-
-        // Lock here to prevent state from changing between checking the state and changing it
-        Lock::GlobalWrite writeLock(txn->lockState());
-
-        if (box.getState().primary()) {
-            return false;
-        }
-
-        if (inc) {
-            log() << "replSet going into maintenance mode (" << _maintenanceMode
-                  << " other tasks)" << rsLog;
-
-            _maintenanceMode++;
-            changeState(MemberState::RS_RECOVERING);
-        }
-        else if (_maintenanceMode > 0) {
-            _maintenanceMode--;
-            // no need to change state, syncTail will try to go live as a secondary soon
-
-            log() << "leaving maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
-        }
-        else {
-            return false;
-        }
-
-        fassert(16844, _maintenanceMode >= 0);
-        return true;
-    }
 
     Member* ReplSetImpl::getMostElectable() {
         lock lk(this);
@@ -390,7 +353,6 @@ namespace {
         _cfg = 0;
         memset(_hbmsg, 0, sizeof(_hbmsg));
         strcpy(_hbmsg , "initial startup");
-        lastH = 0;
         changeState(MemberState::RS_STARTUP);
 
         _seeds = &replSetSeedList.seeds;
@@ -417,55 +379,28 @@ namespace {
                       << " is not present in the current repl set config" << rsLog;
             }
         }
-
-        // Figure out indexPrefetch setting
-        std::string& prefetch = getGlobalReplicationCoordinator()->getSettings().rsIndexPrefetch;
-        if (!prefetch.empty()) {
-            IndexPrefetchConfig prefetchConfig = PREFETCH_ALL;
-            if (prefetch == "none")
-                prefetchConfig = PREFETCH_NONE;
-            else if (prefetch == "_id_only")
-                prefetchConfig = PREFETCH_ID_ONLY;
-            else if (prefetch == "all")
-                prefetchConfig = PREFETCH_ALL;
-            else
-                warning() << "unrecognized indexPrefetch setting: " << prefetch << endl;
-            setIndexPrefetchConfig(prefetchConfig);
-        }
     }
 
     ReplSetImpl::ReplSetImpl() :
         elect(this),
         _forceSyncTarget(0),
-        _blockSync(false),
         _hbmsgTime(0),
         _self(0),
         _maintenanceMode(0),
-        mgr(0),
-        _writerPool(replWriterThreadCount),
-        _prefetcherPool(replPrefetcherThreadCount),
-        oplogVersion(0),
-        initialSyncRequested(false), // only used for resync
-        _indexPrefetchConfig(PREFETCH_ALL) {
+        mgr(0) {
     }
 
     void ReplSetImpl::loadLastOpTimeWritten(OperationContext* txn, bool quiet) {
         Lock::DBRead lk(txn->lockState(), rsoplog);
         BSONObj o;
         if (Helpers::getLast(txn, rsoplog, o)) {
-            lastH = o["h"].numberLong();
-            lastOpTimeWritten = o["ts"]._opTime();
-            uassert(13290, "bad replSet oplog entry?", quiet || !lastOpTimeWritten.isNull());
+            OpTime lastOpTime = o["ts"]._opTime();
+            uassert(13290, "bad replSet oplog entry?", quiet || !lastOpTime.isNull());
+            getGlobalReplicationCoordinator()->setMyLastOptime(txn, lastOpTime);
         }
-    }
-
-    OpTime ReplSetImpl::getEarliestOpTimeWritten() const {
-        OperationContextImpl txn; // XXX?
-        Lock::DBRead lk(txn.lockState(), rsoplog);
-        BSONObj o;
-        uassert(17347, "Problem reading earliest entry from oplog",
-                Helpers::getFirst(&txn, rsoplog, o));
-        return o["ts"]._opTime();
+        else {
+            getGlobalReplicationCoordinator()->setMyLastOptime(txn, OpTime());
+        }
     }
 
     // call after constructing to start - returns fairly quickly after launching its threads
@@ -473,6 +408,8 @@ namespace {
         OperationContextImpl txn;
 
         try {
+            // Note: this sets lastOpTimeWritten, which the Applier uses to determine whether to
+            // do an initial sync or not.
             loadLastOpTimeWritten(&txn);
         }
         catch (std::exception& e) {
@@ -488,7 +425,7 @@ namespace {
         bool meEnsured = false;
         while (!inShutdown() && !meEnsured) {
             try {
-                theReplSet->syncSourceFeedback.ensureMe(&txn);
+                syncSourceFeedback.ensureMe(&txn);
                 meEnsured = true;
             }
             catch (const DBException& e) {
@@ -498,7 +435,8 @@ namespace {
             }
         }
 
-        changeState(MemberState::RS_STARTUP2);
+
+        getGlobalReplicationCoordinator()->setFollowerMode(MemberState::RS_STARTUP2);
         startThreads();
         newReplUp(); // oplog.cpp
     }
@@ -570,6 +508,10 @@ namespace {
                 // kill off rsHealthPoll threads (because they Know Too Much about our past)
                 endOldHealthTasks();
 
+                // clear sync target to avoid faulty sync attempts; we must do this before we
+                // close sockets, since that will trigger the bgsync thread to reconnect.
+                BackgroundSync::get()->clearSyncTarget();
+
                 // close sockets to force clients to re-evaluate this member
                 MessagingPort::closeAllSockets(0);
 
@@ -585,6 +527,11 @@ namespace {
             }
             uassert(13302, "replSet error self appears twice in the repl set configuration", me<=1);
 
+            if (state().removed()) {
+                // If we were removed and have now been added back in, switch state.
+                changeState(MemberState::RS_RECOVERING);
+            }
+
             // if we found different members that the original config, reload everything
             if (reconf && config().members.size() != nfound)
                 additive = false;
@@ -599,21 +546,13 @@ namespace {
 
         _cfg = new ReplSetConfig(c);
 
-        {
-            // Hack to force ReplicationCoordinatorImpl to have a config.
-            // TODO(spencer): rm this once the ReplicationCoordinatorImpl can load its own config.
-            HybridReplicationCoordinator* replCoord =
-                    dynamic_cast<HybridReplicationCoordinator*>(getGlobalReplicationCoordinator());
-            fassert(18648, replCoord);
-            replCoord->setImplConfigHack(_cfg);
-        }
-
         // config() is same thing but const, so we use that when we can for clarity below
         dassert(&config() == _cfg);
         verify(config().ok());
         verify(_name.empty() || _name == config()._id);
         _name = config()._id;
         verify(!_name.empty());
+
         // this is a shortcut for simple changes
         if (additive) {
             log() << "replSet info : additive change to configuration" << rsLog;
@@ -764,7 +703,7 @@ namespace {
             try {
                 OwnedPointerVector<ReplSetConfig> configs;
                 try {
-                    configs.mutableVector().push_back(ReplSetConfig::makeDirect());
+                    configs.mutableVector().push_back(ReplSetConfig::makeDirect(txn));
                 }
                 catch (DBException& e) {
                     log() << "replSet exception loading our local replset configuration object : "
@@ -774,7 +713,7 @@ namespace {
                         i != _seeds->end();
                         i++) {
                     try {
-                        configs.mutableVector().push_back(ReplSetConfig::make(*i));
+                        configs.mutableVector().push_back(ReplSetConfig::make(txn, *i));
                     }
                     catch (DBException& e) {
                         log() << "replSet exception trying to load config from " << *i
@@ -790,7 +729,7 @@ namespace {
                              i++) {
                             try {
                                 configs.mutableVector().push_back(
-                                                            ReplSetConfig::make(HostAndPort(*i)));
+                                                            ReplSetConfig::make(txn, HostAndPort(*i)));
                             }
                             catch (DBException&) {
                                 LOG(1) << "replSet exception trying to load config from discovered "
@@ -803,7 +742,7 @@ namespace {
 
                 if (!replSettings.reconfig.isEmpty()) {
                     try {
-                        configs.mutableVector().push_back(ReplSetConfig::make(replSettings.reconfig,
+                        configs.mutableVector().push_back(ReplSetConfig::make(txn, replSettings.reconfig,
                                                                        true));
                     }
                     catch (DBException& re) {
@@ -852,9 +791,9 @@ namespace {
                 }
 
                 if (!_loadConfigFinish(txn, configs.mutableVector())) {
-                    log() << "replSet info Couldn't load config yet. Sleeping 20sec and will try "
+                    log() << "replSet info Couldn't load config yet. Sleeping 3 sec and will try "
                              "again." << rsLog;
-                    sleepsecs(20);
+                    sleepsecs(3);
                     continue;
                 }
             }
@@ -864,7 +803,7 @@ namespace {
                 log() << "replSet error loading configurations " << e.toString() << rsLog;
                 log() << "replSet error replication will not start" << rsLog;
                 sethbmsg("error loading set config");
-                _fatal();
+                fassertFailedNoTrace(18754);
                 throw;
             }
             break;
@@ -872,58 +811,124 @@ namespace {
         startupStatusMsg.set("? started");
         startupStatus = STARTED;
     }
+    const Member* ReplSetImpl::getMemberToSyncTo() {
+        lock lk(this);
 
-    void ReplSetImpl::_fatal() {
-        box.set(MemberState::RS_FATAL, 0);
-        log() << "replSet error fatal, stopping replication" << rsLog;
-    }
+        // if we have a target we've requested to sync from, use it
 
-    const char* ReplSetImpl::_initialSyncFlagString = "doingInitialSync";
-    const BSONObj ReplSetImpl::_initialSyncFlag(BSON(_initialSyncFlagString << true));
-
-    void ReplSetImpl::clearInitialSyncFlag(OperationContext* txn) {
-        Lock::DBWrite lk(txn->lockState(), "local");
-        WriteUnitOfWork wunit(txn);
-        Helpers::putSingleton(txn, "local.replset.minvalid", BSON("$unset" << _initialSyncFlag));
-        wunit.commit();
-    }
-
-    void ReplSetImpl::setInitialSyncFlag(OperationContext* txn) {
-        Lock::DBWrite lk(txn->lockState(), "local");
-        WriteUnitOfWork wunit(txn);
-        Helpers::putSingleton(txn, "local.replset.minvalid", BSON("$set" << _initialSyncFlag));
-        wunit.commit();
-    }
-
-    bool ReplSetImpl::getInitialSyncFlag() {
-        OperationContextImpl txn; // XXX?
-        Lock::DBRead lk (txn.lockState(), "local");
-        BSONObj mv;
-        if (Helpers::getSingleton(&txn, "local.replset.minvalid", mv)) {
-            return mv[_initialSyncFlagString].trueValue();
+        if (_forceSyncTarget) {
+            Member* target = _forceSyncTarget;
+            _forceSyncTarget = 0;
+            sethbmsg( str::stream() << "syncing to: " << target->fullName() << " by request", 0);
+            return target;
         }
-        return false;
-    }
 
-    void ReplSetImpl::setMinValid(OperationContext* txn, BSONObj obj) {
-        BSONObjBuilder builder;
-        BSONObjBuilder subobj(builder.subobjStart("$set"));
-        subobj.appendTimestamp("ts", obj["ts"].date());
-        subobj.done();
+        const Member* primary = box.getPrimary();
 
-        Lock::DBWrite lk(txn->lockState(), "local");
-        WriteUnitOfWork wunit(txn);
-        Helpers::putSingleton(txn, "local.replset.minvalid", builder.obj());
-        wunit.commit();
-    }
+        // wait for 2N pings before choosing a sync target
+        if (_cfg) {
+            int needMorePings = config().members.size()*2 - HeartbeatInfo::numPings;
 
-    OpTime ReplSetImpl::getMinValid(OperationContext* txn) {
-        Lock::DBRead lk(txn->lockState(), "local.replset.minvalid");
-        BSONObj mv;
-        if (Helpers::getSingleton(txn, "local.replset.minvalid", mv)) {
-            return mv["ts"]._opTime();
+            if (needMorePings > 0) {
+                OCCASIONALLY log() << "waiting for " << needMorePings << " pings from other members before syncing" << endl;
+                return NULL;
+            }
+
+            // If we are only allowed to sync from the primary, return that
+            if (!_cfg->chainingAllowed()) {
+                // Returns NULL if we cannot reach the primary
+                return primary;
+            }
         }
-        return OpTime();
+
+        // find the member with the lowest ping time that has more data than me
+
+        // Find primary's oplog time. Reject sync candidates that are more than
+        // maxSyncSourceLagSecs seconds behind.
+        OpTime primaryOpTime;
+        if (primary)
+            primaryOpTime = primary->hbinfo().opTime;
+        else
+            // choose a time that will exclude no candidates, since we don't see a primary
+            primaryOpTime = OpTime(maxSyncSourceLagSecs, 0);
+
+        if (primaryOpTime.getSecs() < static_cast<unsigned int>(maxSyncSourceLagSecs)) {
+            // erh - I think this means there was just a new election
+            // and we don't yet know the new primary's optime
+            primaryOpTime = OpTime(maxSyncSourceLagSecs, 0);
+        }
+
+        OpTime oldestSyncOpTime(primaryOpTime.getSecs() - maxSyncSourceLagSecs, 0);
+
+        Member *closest = 0;
+        time_t now = 0;
+
+        // Make two attempts.  The first attempt, we ignore those nodes with
+        // slave delay higher than our own.  The second attempt includes such
+        // nodes, in case those are the only ones we can reach.
+        // This loop attempts to set 'closest'.
+        for (int attempts = 0; attempts < 2; ++attempts) {
+            for (Member *m = _members.head(); m; m = m->next()) {
+                if (!m->syncable())
+                    continue;
+
+                if (m->state() == MemberState::RS_SECONDARY) {
+                    // only consider secondaries that are ahead of where we are
+                    if (m->hbinfo().opTime <= lastOpTimeWritten)
+                        continue;
+                    // omit secondaries that are excessively behind, on the first attempt at least.
+                    if (attempts == 0 &&
+                        m->hbinfo().opTime < oldestSyncOpTime)
+                        continue;
+                }
+
+                // omit nodes that are more latent than anything we've already considered
+                if (closest &&
+                    (m->hbinfo().ping > closest->hbinfo().ping))
+                    continue;
+
+                if (attempts == 0 &&
+                    (myConfig().slaveDelay < m->config().slaveDelay || m->config().hidden)) {
+                    continue; // skip this one in the first attempt
+                }
+
+                map<string,time_t>::iterator vetoed = _veto.find(m->fullName());
+                if (vetoed != _veto.end()) {
+                    // Do some veto housekeeping
+                    if (now == 0) {
+                        now = time(0);
+                    }
+
+                    // if this was on the veto list, check if it was vetoed in the last "while".
+                    // if it was, skip.
+                    if (vetoed->second >= now) {
+                        if (time(0) % 5 == 0) {
+                            log() << "replSet not trying to sync from " << (*vetoed).first
+                                  << ", it is vetoed for " << ((*vetoed).second - now) << " more seconds" << rsLog;
+                        }
+                        continue;
+                    }
+                    _veto.erase(vetoed);
+                    // fall through, this is a valid candidate now
+                }
+                // This candidate has passed all tests; set 'closest'
+                closest = m;
+            }
+            if (closest) break; // no need for second attempt
+        }
+
+        if (!closest) {
+            return NULL;
+        }
+
+        sethbmsg( str::stream() << "syncing to: " << closest->fullName(), 0);
+
+        return closest;
+    }
+
+    void ReplSetImpl::veto(const string& host, const Date_t until) {
+        lock lk(this);
+        _veto[host] = until.toTimeT();
     }
 
 } // namespace repl

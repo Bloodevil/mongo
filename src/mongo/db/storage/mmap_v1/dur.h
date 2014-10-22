@@ -33,19 +33,15 @@
 #include "mongo/db/diskloc.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 
+
 namespace mongo {
 
-    class NamespaceDetails;
     class OperationContext;
-    class LockState;
 
     void mongoAbort(const char *msg);
     void abort(); // not defined -- use mongoAbort() instead
 
     namespace dur {
-
-        void releasedWriteLock();
-
         // a smaller limit is likely better on 32 bit
         const unsigned UncommittedBytesLimit = (sizeof(void*)==4) ? 50 * 1024 * 1024 : 100 * 1024 * 1024;
 
@@ -131,7 +127,15 @@ namespace mongo {
                 from growing too large.
                 @return true if commited
             */
-            virtual bool commitIfNeeded(OperationContext* txn, bool force=false) = 0;
+            virtual bool commitIfNeeded(OperationContext* txn) = 0;
+
+            /**
+             * Invoked at clean shutdown time. Performs one last commit/flush and terminates the
+             * flush thread.
+             *
+             * Must be called under the global X lock.
+             */
+            virtual void commitAndStopDurThread(OperationContext* txn) = 0;
 
             /** Declare write intent for an int */
             inline int& writingInt(int& d) { return *static_cast<int*>(writingPtr( &d, sizeof(d))); }
@@ -172,11 +176,9 @@ namespace mongo {
         private:
             static DurableInterface* _impl; // NonDurableImpl at startup()
             static void enableDurability(); // makes _impl a DurableImpl
-            static void disableDurability(); // makes _impl a NonDurableImpl
 
             // these need to be able to enable/disable Durability
             friend void startup();
-            friend class TempDisableDurability;
         }; // class DurableInterface
 
         class NonDurableImpl : public DurableInterface {
@@ -187,13 +189,13 @@ namespace mongo {
             void createdFile(const std::string& filename, unsigned long long len) { }
             bool awaitCommit() { return false; }
             bool commitNow(OperationContext* txn);
-            bool commitIfNeeded(OperationContext* txn, bool force);
+            bool commitIfNeeded(OperationContext* txn);
             void syncDataAndTruncateJournal(OperationContext* txn) {}
             bool isDurable() const { return false; }
+            void commitAndStopDurThread(OperationContext* txn) { }
         };
 
         class DurableImpl : public DurableInterface {
-            bool _aCommitIsNeeded(OperationContext* txn);
             void* writingPtr(void *x, unsigned len);
             void* writingAtOffset(void *buf, unsigned ofs, unsigned len);
             void* writingRangesAtOffsets(void *buf, const std::vector< std::pair< long long, unsigned > > &ranges);
@@ -201,9 +203,10 @@ namespace mongo {
             void createdFile(const std::string& filename, unsigned long long len);
             bool awaitCommit();
             bool commitNow(OperationContext* txn);
-            bool commitIfNeeded(OperationContext* txn, bool force);
+            bool commitIfNeeded(OperationContext* txn);
             void syncDataAndTruncateJournal(OperationContext* txn);
             bool isDurable() const { return true; }
+            void commitAndStopDurThread(OperationContext* txn);
         };
 
     } // namespace dur

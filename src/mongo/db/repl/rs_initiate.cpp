@@ -29,6 +29,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+
 #include "mongo/pch.h"
 
 #include "mongo/db/repl/rs_initiate.h"
@@ -54,7 +56,6 @@
 #include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/util/log.h"
-#include "mongo/util/mmap.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -235,6 +236,7 @@ namespace repl {
 
                 BSONObjBuilder b;
                 b.append("_id", name);
+                b.append("version", 1);
                 BSONObjBuilder members;
                 HostAndPort me = someHostAndPortForMe();
                 members.append("0", BSON( "_id" << 0 << "host" << me.toString() ));
@@ -249,9 +251,21 @@ namespace repl {
                         configObj.toString() << rsLog;
             }
 
+            if (configObj.getField("version").eoo()) {
+                // Missing version field defaults to version 1.
+                BSONObjBuilder builder;
+                builder.appendElements(configObj);
+                builder.append("version", 1);
+                configObj = builder.obj();
+            }
+
             Status status = getGlobalReplicationCoordinator()->processReplSetInitiate(txn,
                                                                                       configObj,
                                                                                       &result);
+            if (status.isOK()) {
+                createOplog(txn);
+                logOpInitiate(txn, BSON("msg" << "initiating set"));
+            }
             return appendCommandStatus(result, status);
         }
     } cmdReplSetInitiate;

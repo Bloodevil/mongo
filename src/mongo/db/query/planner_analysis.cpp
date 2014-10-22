@@ -248,6 +248,23 @@ namespace mongo {
 
     }  // namespace
 
+    // static
+    BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
+        BSONObjBuilder sortBob;
+        BSONObjIterator kpIt(indexKeyPattern);
+        while (kpIt.more()) {
+            BSONElement elt = kpIt.next();
+            if (elt.type() == mongo::String) {
+                break;
+            }
+            long long val = elt.safeNumberLong();
+            int sortOrder = val >= 0 ? 1 : -1;
+            sortBob.append(elt.fieldName(), sortOrder);
+        }
+        return sortBob.obj();
+    }
+
+    // static
     bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
                                               const QueryPlannerParams& params,
                                               QuerySolutionNode** solnRoot) {
@@ -303,6 +320,11 @@ namespace mongo {
             // There's no sort order left to gain by exploding.  Just go home.  TODO: verify nothing
             // clever we can do here.
             if (!kpIt.more()) {
+                return false;
+            }
+
+            // Only explode if there's at least one field to explode for this scan.
+            if (0 == boundsIdx) {
                 return false;
             }
 
@@ -496,7 +518,6 @@ namespace mongo {
                                                            QuerySolutionNode* solnRoot) {
         auto_ptr<QuerySolution> soln(new QuerySolution());
         soln->filterData = query.getQueryObj();
-        verify(soln->filterData.isOwned());
         soln->indexFilterApplied = params.indexFiltersApplied;
 
         solnRoot->computeProperties();

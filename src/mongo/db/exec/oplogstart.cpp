@@ -165,12 +165,13 @@ namespace mongo {
     }
 
     void OplogStart::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         if (_cs) {
             _cs->restoreState(opCtx);
         }
 
         for (size_t i = 0; i < _subIterators.size(); i++) {
-            if (!_subIterators[i]->restoreState()) {
+            if (!_subIterators[i]->restoreState(opCtx)) {
                 _subIterators.erase(_subIterators.begin() + i);
                 // need to hit same i on next pass through loop
                 i--;

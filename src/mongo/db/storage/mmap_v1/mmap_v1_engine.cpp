@@ -43,6 +43,7 @@
 #endif
 
 #include "mongo/db/mongod_options.h"
+#include "mongo/db/storage/mmap_v1/data_file_sync.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
@@ -54,6 +55,7 @@
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
+
 
 namespace mongo {
 
@@ -297,6 +299,8 @@ namespace {
     }
 
     void MMAPV1Engine::finishInit() {
+        dataFileSync.go();
+
         // Replays the journal (if needed) and starts the background thread. This requires the
         // ability to create OperationContexts.
         dur::startup();
@@ -332,6 +336,11 @@ namespace {
     }
 
     Status MMAPV1Engine::closeDatabase( OperationContext* txn, const StringData& db ) {
+        // Before the files are closed, flush any potentially outstanding changes, which might
+        // reference this database. Otherwise we will assert when subsequent applications of the
+        // global journal entries occur, which happen to have write intents for the removed files.
+        getDur().commitNow(txn);
+
         boost::mutex::scoped_lock lk( _entryMapMutex );
         MMAPV1DatabaseCatalogEntry* entry = _entryMap[db.toString()];
         delete entry;
@@ -383,7 +392,8 @@ namespace {
 
         if (storageGlobalParams.dur) {
             log() << "shutdown: final commit..." << endl;
-            getDur().commitNow(txn);
+
+            getDur().commitAndStopDurThread(txn);
 
             flushAllFiles(true);
         }

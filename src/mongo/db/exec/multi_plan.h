@@ -36,6 +36,7 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/db/query/plan_yield_policy.h"
 
 namespace mongo {
 
@@ -81,9 +82,15 @@ namespace mongo {
 
         /**
          * Runs all plans added by addPlan, ranks them, and picks a best.
-         * All further calls to getNext(...) will return results from the best plan.
+         * All further calls to work(...) will return results from the best plan.
+         *
+         * If 'yieldPolicy' is non-NULL, then all locks may be yielded in between round-robin
+         * works of the candidate plans. By default, 'yieldPolicy' is NULL and no yielding will
+         * take place.
+         *
+         * Returns a non-OK status if the plan was killed during yield.
          */
-        void pickBestPlan();
+        Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
 
         /** Return true if a best plan has been chosen  */
         bool bestPlanChosen() const;
@@ -111,18 +118,10 @@ namespace mongo {
         //
 
         /**
-         * Gathers execution stats for all losing plans.
+         * Gathers execution stats for all losing plans. Caller takes ownership of
+         * all pointers in the returned vector.
          */
         vector<PlanStageStats*> generateCandidateStats();
-
-        /**
-         * Runs the candidate plans until each has either hit EOF or returned DEAD. Results
-         * from the plans are thrown out, but execution stats are gathered.
-         *
-         * You should call this after calling pickBestPlan(...). It expects that a winning plan
-         * has already been selected.
-         */
-        Status executeAllPlans();
 
         static const char* kStageType;
 
@@ -141,10 +140,6 @@ namespace mongo {
          */
         bool workAllPlans(size_t numResults);
 
-        void allPlansSaveState();
-
-        void allPlansRestoreState(OperationContext* opCtx);
-
         static const int kNoSuchPlan = -1;
 
         // not owned here
@@ -160,9 +155,6 @@ namespace mongo {
         // tranferred to the PlanExecutor that wraps this stage.
         std::vector<CandidatePlan> _candidates;
 
-        // Candidate plans' stats. Owned here.
-        std::vector<PlanStageStats*> _candidateStats;
-
         // index into _candidates, of the winner of the plan competition
         // uses -1 / kNoSuchPlan when best plan is not (yet) known
         int _bestPlanIdx;
@@ -171,20 +163,24 @@ namespace mongo {
         // uses -1 / kNoSuchPlan when best plan is not (yet) known
         int _backupPlanIdx;
 
-        // Did all plans fail while we were running them?  Note that one plan can fail
+        // Set if this MultiPlanStage cannot continue, and the query must fail. This can happen in
+        // two ways. The first is that all candidate plans fail. Note that one plan can fail
         // during normal execution of the plan competition.  Here is an example:
         //
         // Plan 1: collection scan with sort.  Sort runs out of memory.
         // Plan 2: ixscan that provides sort.  Won't run out of memory.
         //
         // We want to choose plan 2 even if plan 1 fails.
+        //
+        // The second way for failure to occur is that the execution of this query is killed during
+        // a yield, by some concurrent event such as a collection drop.
         bool _failure;
 
         // If everything fails during the plan competition, we can't pick one.
         size_t _failureCount;
 
         // if pickBestPlan fails, this is set to the wsid of the statusMember
-        // returned by ::work() 
+        // returned by ::work()
         WorkingSetID _statusMemberId;
 
         // Stats

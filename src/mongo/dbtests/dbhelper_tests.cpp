@@ -28,6 +28,7 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/write_concern_options.h"
@@ -61,7 +62,7 @@ namespace mongo {
 
             {
                 // Remove _id range [_min, _max).
-                Lock::DBWrite lk(txn.lockState(), ns);
+                Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(ns), MODE_X);
                 WriteUnitOfWork wunit(&txn);
                 Client::Context ctx(&txn,  ns );
 
@@ -186,7 +187,6 @@ namespace mongo {
         long long estSizeBytes;
         {
             Lock::DBRead lk(txn.lockState(), ns);
-            Client::Context ctx(&txn,  ns );
 
             // search invalid index range
             KeyRange range( ns,
@@ -232,7 +232,7 @@ namespace mongo {
         long long estSizeBytes;
         {
             Lock::DBRead lk(txn.lockState(), ns);
-            Client::Context ctx(&txn,  ns );
+
             KeyRange range( ns,
                             BSON( "_id" << 0 ),
                             BSON( "_id" << numDocsInserted ),

@@ -39,6 +39,7 @@
 #include "mongo/db/query/stage_types.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/net/listen.h" // for Listener::getElapsedTimeMillis()
 
 namespace mongo {
 
@@ -96,34 +97,6 @@ namespace mongo {
     private:
         // Default constructor is illegal.
         CommonStats();
-    };
-
-    /**
-     * This class increments a counter by the time elapsed since its construction when
-     * it goes out of scope.
-     */
-    class ScopedTimer {
-    public:
-        ScopedTimer(long long* counter) : _counter(counter) {
-            _start = curTimeMillis64();
-        }
-
-        ~ScopedTimer() {
-            long long elapsed = curTimeMillis64() - _start;
-            *_counter += elapsed;
-        }
-
-    private:
-        // Default constructor disallowed.
-        ScopedTimer();
-
-        MONGO_DISALLOW_COPYING(ScopedTimer);
-
-        // Reference to the counter that we are incrementing with the elapsed time.
-        long long* _counter;
-
-        // Time at which the timer was constructed.
-        long long _start;
     };
 
     // The universal container for a stage's stats.
@@ -232,7 +205,7 @@ namespace mongo {
     };
 
     struct CollectionScanStats : public SpecificStats {
-        CollectionScanStats() : docsTested(0) { }
+        CollectionScanStats() : docsTested(0), direction(1) { }
 
         virtual SpecificStats* clone() const {
             CollectionScanStats* specific = new CollectionScanStats(*this);
@@ -241,16 +214,39 @@ namespace mongo {
 
         // How many documents did we check against our filter?
         size_t docsTested;
+
+        // >0 if we're traversing the collection forwards. <0 if we're traversing it
+        // backwards.
+        int direction;
     };
 
     struct CountStats : public SpecificStats {
-        CountStats() : isMultiKey(false),
-                       keysExamined(0) { }
-
-        virtual ~CountStats() { }
+        CountStats() : nCounted(0), nSkipped(0), trivialCount(false) { }
 
         virtual SpecificStats* clone() const {
             CountStats* specific = new CountStats(*this);
+            return specific;
+        }
+
+        // The result of the count.
+        long long nCounted;
+
+        // The number of results we skipped over.
+        long long nSkipped;
+
+        // A "trivial count" is one that we can answer by calling numRecords() on the
+        // collection, without actually going through any query logic.
+        bool trivialCount;
+    };
+
+    struct CountScanStats : public SpecificStats {
+        CountScanStats() : isMultiKey(false),
+                           keysExamined(0) { }
+
+        virtual ~CountScanStats() { }
+
+        virtual SpecificStats* clone() const {
+            CountScanStats* specific = new CountScanStats(*this);
             // BSON objects have to be explicitly copied.
             specific->keyPattern = keyPattern.getOwned();
             return specific;
@@ -317,6 +313,20 @@ namespace mongo {
 
         // The total number of full documents touched by the fetch stage.
         size_t docsExamined;
+    };
+
+    struct GroupStats : public SpecificStats {
+        GroupStats() : nGroups(0) { }
+
+        virtual ~GroupStats() { }
+
+        virtual SpecificStats* clone() const {
+            GroupStats* specific = new GroupStats(*this);
+            return specific;
+        }
+
+        // The total number of groups.
+        size_t nGroups;
     };
 
     struct IDHackStats : public SpecificStats {

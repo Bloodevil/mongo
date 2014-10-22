@@ -105,7 +105,8 @@ namespace mongo {
             out.push_back(sa);
 
 #ifndef _WIN32
-            if (useUnixSockets && (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0")) // only IPv4
+            if (sa.isValid() && useUnixSockets &&
+                    (sa.getAddr() == "127.0.0.1" || sa.getAddr() == "0.0.0.0")) // only IPv4
                 out.push_back(SockAddr(makeUnixSockPath(port).c_str(), port));
 #endif
         }
@@ -141,6 +142,11 @@ namespace mongo {
              ++it) {
 
             const SockAddr& me = *it;
+
+            if (!me.isValid()) {
+                error() << "listen(): socket is invalid." << endl;
+                return;
+            }
 
             SOCKET sock = ::socket(me.getType(), SOCK_STREAM, 0);
             ScopeGuard socketGuard = MakeGuard(&closesocket, sock);
@@ -188,13 +194,6 @@ namespace mongo {
                 ListeningSockets::get()->addPath( me.getAddr() );
             }
 #endif
-            
-            if ( ::listen(sock, 128) != 0 ) {
-                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
-                return;
-            }
-
-            ListeningSockets::get()->add( sock );
 
             _socks.push_back(sock);
             socketGuard.Dismiss();
@@ -212,8 +211,16 @@ namespace mongo {
 
         SOCKET maxfd = 0; // needed for select()
         for (unsigned i = 0; i < _socks.size(); i++) {
-            if (_socks[i] > maxfd)
+            if (::listen(_socks[i], 128) != 0) {
+                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
+                return;
+            }
+
+            ListeningSockets::get()->add(_socks[i]);
+
+            if (_socks[i] > maxfd) {
                 maxfd = _socks[i];
+            }
         }
 
         if ( maxfd >= FD_SETSIZE ) {
@@ -381,12 +388,21 @@ namespace mongo {
             return;
         }
 
+        for (unsigned i = 0; i < _socks.size(); i++) {
+            if (::listen(_socks[i], 128) != 0) {
+                error() << "listen(): listen() failed " << errnoWithDescription() << endl;
+                return;
+            }
+
+            ListeningSockets::get()->add(_socks[i]);
+        }
+
 #ifdef MONGO_SSL
         _logListen(_port, _ssl);
 #else
         _logListen(_port, false);
 #endif
-                
+
         OwnedPointerVector<EventHolder> eventHolders;
         boost::scoped_array<WSAEVENT> events(new WSAEVENT[_socks.size()]);
         
@@ -608,12 +624,14 @@ namespace mongo {
             log() << "closing listening socket: " << sock << std::endl;
             closesocket( sock );
         }
+        delete sockets;
 
         for ( std::set<std::string>::iterator i=paths->begin(); i!=paths->end(); i++ ) {
             std::string path = *i;
             log() << "removing socket file: " << path << std::endl;
             ::remove( path.c_str() );
         }
+        delete paths;
     }
 
 }

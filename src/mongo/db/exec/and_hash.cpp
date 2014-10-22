@@ -30,6 +30,7 @@
 
 #include "mongo/db/exec/and_common-inl.h"
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/util/mongoutils/str.h"
@@ -445,6 +446,7 @@ namespace mongo {
     }
 
     void AndHashStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
 
         for (size_t i = 0; i < _children.size(); ++i) {

@@ -53,6 +53,10 @@ namespace mongo {
         return _entryMap.empty();
     }
 
+    int64_t Heap1DatabaseCatalogEntry::sizeOnDisk( OperationContext* opCtx ) const {
+        return isEmpty() ? 0 : 1;
+    }
+
     void Heap1DatabaseCatalogEntry::appendExtraStats( OperationContext* opCtx,
                                                       BSONObjBuilder* out,
                                                       double scale ) const {
@@ -87,7 +91,7 @@ namespace mongo {
                                                         const StringData& ns,
                                                         const CollectionOptions& options,
                                                         bool allocateDefaultSpace ) {
-        dynamic_cast<Heap1RecoveryUnit*>( opCtx->recoveryUnit() )->rollbackPossible = false;
+        dynamic_cast<Heap1RecoveryUnit*>( opCtx->recoveryUnit() )->rollbackImpossible();
         boost::mutex::scoped_lock lk( _entryMapLock );
         Entry*& entry = _entryMap[ ns.toString() ];
         if ( entry )
@@ -115,7 +119,7 @@ namespace mongo {
                                                       const StringData& ns ) {
         //TODO: invariant( opCtx->lockState()->isWriteLocked( ns ) );
 
-        dynamic_cast<Heap1RecoveryUnit*>( opCtx->recoveryUnit() )->rollbackPossible = false;
+        dynamic_cast<Heap1RecoveryUnit*>( opCtx->recoveryUnit() )->rollbackImpossible();
         boost::mutex::scoped_lock lk( _entryMapLock );
         EntryMap::iterator i = _entryMap.find( ns.toString() );
 
@@ -137,7 +141,7 @@ namespace mongo {
         if ( !e ) {
             _entryMap.erase( fromNS.toString() );
             return Status( ErrorCodes::NamespaceNotFound,
-                           "cannot renameCollection missng collection" );
+                           "cannot renameCollection missing collection" );
         }
 
         if ( _entryMap[toNS.toString()] ) {

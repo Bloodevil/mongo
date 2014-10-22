@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/db/global_environment_d.h"
 
 #include <set>
@@ -174,8 +176,8 @@ namespace mongo {
     void GlobalEnvironmentMongoD::forEachOperationContext(ProcessOperationContext* procOpCtx) {
         scoped_lock lock(_registeredOpContextsMutex);
 
-        OperationContextSet::iterator it;
-        for (it = _registeredOpContexts.begin(); it != _registeredOpContexts.end(); it++) {
+        OperationContextSet::const_iterator it;
+        for (it = _registeredOpContexts.begin(); it != _registeredOpContexts.end(); ++it) {
             procOpCtx->processOpContext(*it);
         }
     }

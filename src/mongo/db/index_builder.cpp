@@ -32,13 +32,13 @@
 
 #include "mongo/db/index_builder.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -66,11 +66,13 @@ namespace mongo {
         Client::initThread(name().c_str());
         Lock::ParallelBatchWriterMode::iAmABatchParticipant(txn.lockState());
 
-        repl::replLocalAuth();
+        txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
 
-        cc().curop()->reset(HostAndPort(), dbInsert);
+        txn.getCurOp()->reset(HostAndPort(), dbInsert);
         NamespaceString ns(_index["ns"].String());
-        Client::WriteContext ctx(&txn, ns.getSystemIndexesCollection());
+
+        Lock::DBLock dlk(txn.lockState(), ns.db(), MODE_X);
+        Client::Context ctx(&txn, ns.getSystemIndexesCollection());
 
         Database* db = dbHolder().get(&txn, ns.db().toString());
 
@@ -78,9 +80,8 @@ namespace mongo {
         if ( !status.isOK() ) {
             log() << "IndexBuilder could not build index: " << status.toString();
         }
-        ctx.commit();
 
-        cc().shutdown();
+        txn.getClient()->shutdown();
     }
 
     Status IndexBuilder::buildInForeground(OperationContext* txn, Database* db) const {

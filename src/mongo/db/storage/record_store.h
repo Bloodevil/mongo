@@ -103,7 +103,9 @@ namespace mongo {
         virtual void saveState() = 0;
 
         // Returns true if collection still exists, false otherwise.
-        virtual bool restoreState() = 0;
+        // The state of the iterator may be restored into a different context
+        // than the one it was created in.
+        virtual bool restoreState(OperationContext* txn) = 0;
 
         // normally this will just go back to the RecordStore and convert
         // but this gives the iterator an oppurtnity to optimize
@@ -145,6 +147,14 @@ namespace mongo {
 
         virtual RecordData dataFor( OperationContext* txn, const DiskLoc& loc) const = 0;
 
+        /**
+         * @param out - If the record exists, the contents of this are set.
+         * @return true iff there is a Record for loc
+         */
+        virtual bool findRecord( OperationContext* txn,
+                                 const DiskLoc& loc,
+                                 RecordData* out ) const = 0;
+
         virtual void deleteRecord( OperationContext* txn, const DiskLoc& dl ) = 0;
 
         virtual StatusWith<DiskLoc> insertRecord( OperationContext* txn,
@@ -171,18 +181,17 @@ namespace mongo {
 
         virtual Status updateWithDamages( OperationContext* txn,
                                           const DiskLoc& loc,
-                                          const char* damangeSource,
+                                          const RecordData& oldRec,
+                                          const char* damageSource,
                                           const mutablebson::DamageVector& damages ) = 0;
         /**
          * returned iterator owned by caller
-         * canonical to get all would be
-         * getIterator( txn, DiskLoc(), false, CollectionScanParams::FORWARD )
+         * Default arguments return all items in record store.
          */
         virtual RecordIterator* getIterator( OperationContext* txn,
                                              const DiskLoc& start = DiskLoc(),
-                                             bool tailable = false,
                                              const CollectionScanParams::Direction& dir =
-                                             CollectionScanParams::FORWARD
+                                                     CollectionScanParams::FORWARD
                                              ) const = 0;
 
         /**

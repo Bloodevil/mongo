@@ -36,11 +36,11 @@
 
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
+
 
 namespace mongo {
 
@@ -65,16 +65,10 @@ namespace mongo {
         }
     }
 
-    NOINLINE_DECL void DataFile::badOfs2(int ofs) const {
-        uasserted(13441, str::stream() << "bad offset:" << ofs
-                  << " accessing file: " << mmf.filename()
-                  << ". See http://dochub.mongodb.org/core/data-recovery");
-    }
-
     NOINLINE_DECL void DataFile::badOfs(int ofs) const {
-        uasserted(13440, str::stream()  << "bad offset:" << ofs
-                  << " accessing file: " << mmf.filename()
-                  << ". See http://dochub.mongodb.org/core/data-recovery");
+        msgasserted(13440, str::stream()  << "bad offset:" << ofs
+                    << " accessing file: " << mmf.filename()
+                    << ". See http://dochub.mongodb.org/core/data-recovery");
     }
 
     int DataFile::defaultSize( const char *filename ) const {
@@ -90,7 +84,7 @@ namespace mongo {
     }
 
     /** @return true if found and opened. if uninitialized (prealloc only) does not open. */
-    Status DataFile::openExisting( OperationContext* txn, const char *filename ) {
+    Status DataFile::openExisting(const char *filename) {
         verify( _mb == 0 );
         if( !boost::filesystem::exists(filename) )
             return Status( ErrorCodes::InvalidPath, "DataFile::openExisting - file does not exist" );
@@ -208,8 +202,7 @@ namespace mongo {
             verify( HeaderSize == 8192 );
             DataFileHeader *h = getDur().writing(this);
             h->fileLength = filelength;
-            h->version = PDFILE_VERSION;
-            h->versionMinor = PDFILE_VERSION_MINOR_22_AND_OLDER; // All dbs start like this
+            h->version = DataFileVersion::defaultForNewFiles();
             h->unused.set( fileno, HeaderSize );
             verify( (data-(char*)this) == HeaderSize );
             h->unusedLength = fileLength - HeaderSize - 16;

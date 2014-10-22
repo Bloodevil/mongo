@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/query/planner_access.h"
 
 #include <algorithm>
@@ -38,6 +40,7 @@
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/util/log.h"
@@ -405,11 +408,13 @@ namespace mongo {
                 MatchExpression* child = amExpr->getChild(curChild);
                 IndexTag* ixtag = static_cast<IndexTag*>(child->getTag());
                 invariant(NULL != ixtag);
-                // Only want prefixes.
-                if (ixtag->pos >= prefixEnd) {
+                // Skip this child if it's not part of a prefix, or if we've already assigned a
+                // predicate to this prefix position.
+                if (ixtag->pos >= prefixEnd || prefixExprs[ixtag->pos] != NULL) {
                     ++curChild;
                     continue;
                 }
+                // prefixExprs takes ownership of 'child'.
                 prefixExprs[ixtag->pos] = child;
                 amExpr->getChildVector()->erase(amExpr->getChildVector()->begin() + curChild);
                 // Don't increment curChild.
@@ -871,7 +876,7 @@ namespace mongo {
                 asn->children.swap(ixscanNodes);
                 andResult = asn;
             }
-            else {
+            else if (internalQueryPlannerEnableHashIntersection) {
                 AndHashNode* ahn = new AndHashNode();
                 ahn->children.swap(ixscanNodes);
                 andResult = ahn;
@@ -886,6 +891,17 @@ namespace mongo {
                         break;
                     }
                 }
+            }
+            else {
+                // We can't use sort-based intersection, and hash-based intersection is disabled.
+                // Clean up the index scans and bail out by returning NULL.
+                QLOG() << "Can't build index intersection solution: "
+                       << "AND_SORTED is not possible and AND_HASH is disabled.";
+
+                for (size_t i = 0; i < ixscanNodes.size(); i++) {
+                    delete ixscanNodes[i];
+                }
+                return NULL;
             }
         }
 

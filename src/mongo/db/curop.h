@@ -32,6 +32,7 @@
 #pragma once
 
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/lock_stat.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/spin_lock.h"
@@ -39,8 +40,10 @@
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/time_support.h"
 
+
 namespace mongo {
 
+    class Client;
     class Command;
     class CurOp;
 
@@ -199,12 +202,11 @@ namespace mongo {
         BSONObj query() const { return _query.get();  }
         void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
         
-        void enter( Client::Context * context );
+        void enter(const char* ns, int dbProfileLevel);
         void reset();
         void reset( const HostAndPort& remote, int op );
         void markCommand() { _isCommand = true; }
         OpDebug& debug()           { return _debug; }
-        int profileLevel() const   { return _dbprofile; }
         string getNS() const { return _ns.toString(); }
 
         bool shouldDBProfile( int ms ) const {

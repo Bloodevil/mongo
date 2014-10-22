@@ -41,7 +41,6 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/concurrency/lock_mgr.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/operation_context.h"
@@ -131,10 +130,9 @@ namespace mongo {
 
     RecordIterator* Collection::getIterator( OperationContext* txn,
                                              const DiskLoc& start,
-                                             bool tailable,
                                              const CollectionScanParams::Direction& dir) const {
         invariant( ok() );
-        return _recordStore->getIterator( txn, start, tailable, dir );
+        return _recordStore->getIterator( txn, start, dir );
     }
 
     vector<RecordIterator*> Collection::getManyIterators( OperationContext* txn ) const {
@@ -144,7 +142,6 @@ namespace mongo {
     int64_t Collection::countTableScan( OperationContext* txn, const MatchExpression* expression ) {
         scoped_ptr<RecordIterator> iterator( getIterator( txn,
                                                           DiskLoc(),
-                                                          false,
                                                           CollectionScanParams::FORWARD ) );
         int64_t count = 0;
         while ( !iterator->isEOF() ) {
@@ -161,10 +158,18 @@ namespace mongo {
         return  _recordStore->dataFor( txn, loc ).toBson();
     }
 
+    bool Collection::findDoc(OperationContext* txn, const DiskLoc& loc, BSONObj* out) const {
+        RecordData rd;
+        if ( !_recordStore->findRecord( txn, loc, &rd ) )
+            return false;
+        *out = rd.toBson();
+        return true;
+    }
+
     StatusWith<DiskLoc> Collection::insertDocument( OperationContext* txn,
                                                     const DocWriter* doc,
                                                     bool enforceQuota ) {
-        verify( _indexCatalog.numIndexesTotal( txn ) == 0 ); // eventually can implement, just not done
+        invariant( !_indexCatalog.haveAnyIndexes() ); // eventually can implement, just not done
 
         StatusWith<DiskLoc> loc = _recordStore->insertRecord( txn,
                                                               doc,
@@ -230,6 +235,9 @@ namespace mongo {
                                                               _enforceQuota( enforceQuota ) );
         if ( !loc.isOK() )
             return loc;
+
+        invariant( minDiskLoc < loc.getValue() );
+        invariant( loc.getValue() < maxDiskLoc );
 
         _infoCache.notifyOfWriteOp();
 
@@ -313,14 +321,6 @@ namespace mongo {
                 return StatusWith<DiskLoc>( ErrorCodes::InternalError,
                                             "in Collection::updateDocument _id mismatch",
                                             13596 );
-        }
-
-        if ( ns().coll() == "system.users" ) {
-            // XXX - andy and spencer think this should go away now
-            V2UserDocumentParser parser;
-            Status s = parser.checkValidUserDocument(objNew);
-            if ( !s.isOK() )
-                return StatusWith<DiskLoc>( s );
         }
 
         /* duplicate key check. we descend the btree twice - once for this check, and once for the actual inserts, further
@@ -408,14 +408,14 @@ namespace mongo {
 
     Status Collection::updateDocumentWithDamages( OperationContext* txn,
                                                   const DiskLoc& loc,
+                                                  const RecordData& oldRec,
                                                   const char* damangeSource,
                                                   const mutablebson::DamageVector& damages ) {
 
         // Broadcast the mutation so that query results stay correct.
         _cursorCache.invalidateDocument(loc, INVALIDATION_MUTATION);
 
-        ExclusiveResourceLock lk(txn->getTransaction(), *(size_t*)&loc);
-        return _recordStore->updateWithDamages( txn, loc, damangeSource, damages );
+        return _recordStore->updateWithDamages( txn, loc, oldRec, damangeSource, damages );
     }
 
     bool Collection::_enforceQuota( bool userEnforeQuota ) const {
@@ -444,6 +444,31 @@ namespace mongo {
 
     uint64_t Collection::dataSize( OperationContext* txn ) const {
         return _recordStore->dataSize( txn );
+    }
+
+    uint64_t Collection::getIndexSize(OperationContext* opCtx,
+                                      BSONObjBuilder* details,
+                                      int scale) {
+
+        IndexCatalog* idxCatalog = getIndexCatalog();
+
+        IndexCatalog::IndexIterator ii = idxCatalog->getIndexIterator(opCtx, true);
+
+        uint64_t totalSize = 0;
+
+        while (ii.more()) {
+            IndexDescriptor* d = ii.next();
+            IndexAccessMethod* iam = idxCatalog->getIndex(d);
+
+            long long ds = iam->getSpaceUsedBytes(opCtx);
+
+            totalSize += ds;
+            if (details) {
+                details->appendNumber(d->indexName(), ds / scale);
+            }
+        }
+
+        return totalSize;
     }
 
     /**

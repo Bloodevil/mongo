@@ -77,9 +77,10 @@ namespace mongo {
                               const DiskLoc& loc,
                               bool dupsAllowed) = 0;
 
-        virtual bool unindex(OperationContext* txn,
+        virtual void unindex(OperationContext* txn,
                              const BSONObj& key,
-                             const DiskLoc& loc) = 0;
+                             const DiskLoc& loc,
+                             bool dupsAllowed) = 0;
 
         // TODO: Hide this by exposing an update method?
         virtual Status dupKeyCheck(OperationContext* txn,
@@ -91,7 +92,7 @@ namespace mongo {
         //
 
         // TODO: expose full set of args for testing?
-        virtual void fullValidate(OperationContext* txn, long long* numKeysOut) = 0;
+        virtual void fullValidate(OperationContext* txn, long long* numKeysOut) const = 0;
 
         /**
          * @see IndexAccessMethod::getSpaceUsedBytes
@@ -105,10 +106,24 @@ namespace mongo {
          */
         virtual Status touch(OperationContext* txn) const = 0;
 
-        //
-        // Navigation
-        //
+        /**
+         * Implementors SHOULD override this with an efficient representation if at all possible.
+         * @return the number of entries in the index.
+         */
+        virtual long long numEntries( OperationContext* txn ) const {
+            long long x = -1;
+            fullValidate( txn, &x );
+            return x;
+        }
 
+        /**
+         * Navigation
+         *
+         * A cursor is tied to a transaction, such as the OperationContext or a WriteUnitOfWork
+         * inside that context. Any cursor acquired inside a transaction is invalid outside
+         * of that transaction, instead use the savePosition() and restorePosition() methods
+         * reestablish the cursor.
+         */
         class Cursor {
         public:
             virtual ~Cursor() {}
@@ -163,7 +178,7 @@ namespace mongo {
             //
             virtual void savePosition() = 0;
 
-            virtual void restorePosition() = 0;
+            virtual void restorePosition(OperationContext* txn) = 0;
         };
 
         /**

@@ -34,11 +34,11 @@
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/keep_mutations.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
@@ -61,8 +61,7 @@ namespace QueryStageKeep {
         }
 
         void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(), false,
-                                                   CollectionScanParams::FORWARD);
+            RecordIterator* it = coll->getIterator(&_txn);
             while (!it->isEOF()) {
                 DiskLoc nextLoc = it->getNext();
                 out->insert(nextLoc);
@@ -106,12 +105,14 @@ namespace QueryStageKeep {
     public:
         void run() {
             Client::WriteContext ctx(&_txn, ns());
-
             Database* db = ctx.ctx().db();
             Collection* coll = db->getCollection(&_txn, ns());
             if (!coll) {
+                WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
+                wuow.commit();
             }
+
             WorkingSet ws;
 
             // Add 10 objects to the collection.
@@ -127,7 +128,6 @@ namespace QueryStageKeep {
                 member->obj = BSON("x" << 2);
                 ws.flagForReview(id);
             }
-            ctx.commit();
 
             // Create a collscan to provide the 10 objects in the collection.
             CollectionScanParams params;
@@ -139,10 +139,10 @@ namespace QueryStageKeep {
 
             // Create a KeepMutations stage to merge in the 10 flagged objects.
             // Takes ownership of 'cs'
-            KeepMutationsStage* keep = new KeepMutationsStage(NULL, &ws, cs);
+            std::auto_ptr<KeepMutationsStage> keep(new KeepMutationsStage(NULL, &ws, cs));
 
             for (size_t i = 0; i < 10; ++i) {
-                WorkingSetID id = getNextResult(keep);
+                WorkingSetID id = getNextResult(keep.get());
                 WorkingSetMember* member = ws.get(id);
                 ASSERT_FALSE(ws.isFlagged(id));
                 ASSERT_EQUALS(member->obj["x"].numberInt(), 1);
@@ -152,7 +152,7 @@ namespace QueryStageKeep {
 
             // Flagged results *must* be at the end.
             for (size_t i = 0; i < 10; ++i) {
-                WorkingSetID id = getNextResult(keep);
+                WorkingSetID id = getNextResult(keep.get());
                 WorkingSetMember* member = ws.get(id);
                 ASSERT(ws.isFlagged(id));
                 ASSERT_EQUALS(member->obj["x"].numberInt(), 2);

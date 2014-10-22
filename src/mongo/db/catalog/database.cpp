@@ -51,7 +51,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
-#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/top.h"
@@ -95,11 +94,6 @@ namespace mongo {
         if ( BackgroundOperation::inProgForDb( _name ) ) {
             log() << "warning: bg op in prog during close db? " << _name << endl;
         }
-
-        // Before the files are closed, flush any potentially outstanding changes, which might
-        // reference this database. Otherwise we will assert when subsequent commit if needed
-        // is called and it happens to have write intents for the removed files.
-        txn->recoveryUnit()->commitIfNeeded(true);
     }
 
     Status Database::validateDBName( const StringData& dbname ) {
@@ -137,9 +131,7 @@ namespace mongo {
         return Status::OK();
     }
 
-    Database::Database(OperationContext* txn,
-                       const StringData& name,
-                       DatabaseCatalogEntry* dbEntry )
+    Database::Database(const StringData& name, DatabaseCatalogEntry* dbEntry)
         : _name(name.toString()),
           _dbEntry( dbEntry ),
           _profileName(_name + ".system.profile"),
@@ -245,34 +237,6 @@ namespace mongo {
         return true;
     }
 
-    long long Database::getIndexSizeForCollection(OperationContext* opCtx,
-                                                  Collection* coll,
-                                                  BSONObjBuilder* details,
-                                                  int scale ) {
-        if ( !coll )
-            return 0;
-
-        IndexCatalog* idxCatalog = coll->getIndexCatalog();
-
-        IndexCatalog::IndexIterator ii = idxCatalog->getIndexIterator( opCtx, true );
-
-        long long totalSize = 0;
-
-        while ( ii.more() ) {
-            IndexDescriptor* d = ii.next();
-            IndexAccessMethod* iam = idxCatalog->getIndex( d );
-
-            long long ds = iam->getSpaceUsedBytes( opCtx );
-
-            totalSize += ds;
-            if ( details ) {
-                details->appendNumber( d->indexName(), ds / scale );
-            }
-        }
-
-        return totalSize;
-    }
-
     void Database::getStats( OperationContext* opCtx, BSONObjBuilder* output, double scale ) {
         list<string> collections;
         _dbEntry->getCollectionNamespaces( &collections );
@@ -301,10 +265,9 @@ namespace mongo {
             numExtents += temp.obj()["numExtents"].numberInt(); // XXX
 
             indexes += collection->getIndexCatalog()->numIndexesTotal( opCtx );
-            indexSize += getIndexSizeForCollection(opCtx, collection);
+            indexSize += collection->getIndexSize(opCtx);
         }
 
-        output->append      ( "db" , _name );
         output->appendNumber( "collections" , ncollections );
         output->appendNumber( "objects" , objects );
         output->append      ( "avgObjSize" , objects == 0 ? 0 : double(size) / double(objects) );
@@ -542,11 +505,13 @@ namespace mongo {
         if( n.size() == 0 ) return;
         log() << "dropAllDatabasesExceptLocal " << n.size() << endl;
 
-        for( vector<string>::iterator i = n.begin(); i != n.end(); i++ ) {
-            if( *i != "local" ) {
+        for (vector<string>::iterator i = n.begin(); i != n.end(); i++) {
+            if (*i != "local") {
+                Database* db = dbHolder().get(txn, *i);
+                invariant(db);
+
                 WriteUnitOfWork wunit(txn);
-                Client::Context ctx(txn, *i);
-                dropDatabase(txn, ctx.db());
+                dropDatabase(txn, db);
                 wunit.commit();
             }
         }
@@ -574,7 +539,7 @@ namespace mongo {
         txn->recoveryUnit()->syncDataAndTruncateJournal();
 
         dbHolder().close( txn, name );
-        db = 0; // d is now deleted
+        db = NULL; // d is now deleted
 
         getGlobalEnvironment()->getGlobalStorageEngine()->dropDatabase( txn, name );
     }

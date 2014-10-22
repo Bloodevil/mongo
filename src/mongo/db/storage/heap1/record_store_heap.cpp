@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/db/storage/heap1/record_store_heap.h"
 
 #include "mongo/util/log.h"
@@ -69,8 +71,21 @@ namespace mongo {
 
     HeapRecordStore::HeapRecord* HeapRecordStore::recordFor(const DiskLoc& loc) const {
         Records::const_iterator it = _records.find(loc);
+        if ( it == _records.end() ) {
+            error() << "HeapRecordStore::recordFor cannot find record for " << ns() << ":" << loc;
+        }
         invariant(it != _records.end());
         return reinterpret_cast<HeapRecord*>(it->second.get());
+    }
+
+    bool HeapRecordStore::findRecord( OperationContext* txn,
+                                      const DiskLoc& loc, RecordData* rd ) const {
+        Records::const_iterator it = _records.find(loc);
+        if ( it == _records.end() ) {
+            return false;
+        }
+        *rd = reinterpret_cast<HeapRecord*>(it->second.get())->toRecordData();
+        return true;
     }
 
     void HeapRecordStore::deleteRecord(OperationContext* txn, const DiskLoc& loc) {
@@ -201,7 +216,8 @@ namespace mongo {
 
     Status HeapRecordStore::updateWithDamages( OperationContext* txn,
                                                const DiskLoc& loc,
-                                               const char* damangeSource,
+                                               const RecordData& oldRec,
+                                               const char* damageSource,
                                                const mutablebson::DamageVector& damages ) {
         HeapRecord* rec = recordFor( loc );
         char* root = rec->data();
@@ -210,7 +226,7 @@ namespace mongo {
         mutablebson::DamageVector::const_iterator where = damages.begin();
         const mutablebson::DamageVector::const_iterator end = damages.end();
         for( ; where != end; ++where ) {
-            const char* sourcePtr = damangeSource + where->sourceOffset;
+            const char* sourcePtr = damageSource + where->sourceOffset;
             char* targetPtr = root + where->targetOffset;
             std::memcpy(targetPtr, sourcePtr, where->size);
         }
@@ -220,13 +236,10 @@ namespace mongo {
 
     RecordIterator* HeapRecordStore::getIterator(OperationContext* txn,
                                                  const DiskLoc& start,
-                                                 bool tailable,
                                                  const CollectionScanParams::Direction& dir) const {
-        if (tailable)
-            invariant(_isCapped && dir == CollectionScanParams::FORWARD);
 
         if (dir == CollectionScanParams::FORWARD) {
-            return new HeapRecordIterator(txn, _records, *this, start, tailable);
+            return new HeapRecordIterator(txn, _records, *this, start, false);
         }
         else {
             return new HeapRecordReverseIterator(txn, _records, *this, start);
@@ -325,7 +338,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        return Status( ErrorCodes::BadValue,
+        return Status( ErrorCodes::InvalidOptions,
                        mongoutils::str::stream()
                        << "unknown custom option to HeapRecordStore: "
                        << name );
@@ -434,7 +447,8 @@ namespace mongo {
     void HeapRecordIterator::saveState() {
     }
 
-    bool HeapRecordIterator::restoreState() {
+    bool HeapRecordIterator::restoreState(OperationContext* txn) {
+        _txn = txn;
         return !_killedByInvalidate;
     }
 
@@ -458,7 +472,10 @@ namespace mongo {
             _it = _records.rbegin();
         }
         else {
-            _it = HeapRecordStore::Records::const_reverse_iterator(_records.find(start));
+            // The reverse iterator will point to the preceding element, so we
+            // increment the base iterator to make it point past the found element
+            HeapRecordStore::Records::const_iterator baseIt(++_records.find(start));
+            _it = HeapRecordStore::Records::const_reverse_iterator(baseIt);
             invariant(_it != _records.rend());
         }
     }
@@ -499,7 +516,7 @@ namespace mongo {
     void HeapRecordReverseIterator::saveState() {
     }
 
-    bool HeapRecordReverseIterator::restoreState() {
+    bool HeapRecordReverseIterator::restoreState(OperationContext* txn) {
         return !_killedByInvalidate;
     }
 

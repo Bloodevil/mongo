@@ -57,7 +57,6 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h" // this is ugly
 #include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -819,6 +818,10 @@ namespace {
 
     // ---------------------------
 
+    bool IndexCatalog::haveAnyIndexes() const {
+        return _entries.size() != 0;
+    }
+
     int IndexCatalog::numIndexesTotal( OperationContext* txn ) const {
         return _collection->getCatalogEntry()->getTotalIndexCount( txn );
     }
@@ -967,20 +970,24 @@ namespace {
 
     // ---------------------------
 
+    namespace {
+        bool isDupsAllowed( IndexDescriptor* desc ) {
+            bool isUnique = desc->unique() || KeyPattern::isIdKeyPattern(desc->keyPattern());
+            if ( !isUnique )
+                return true;
+
+            return repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(desc);
+        }
+
+    }
+
     Status IndexCatalog::_indexRecord(OperationContext* txn,
                                       IndexCatalogEntry* index,
                                       const BSONObj& obj,
                                       const DiskLoc &loc ) {
         InsertDeleteOptions options;
         options.logIfError = false;
-
-        bool isUnique =
-            KeyPattern::isIdKeyPattern(index->descriptor()->keyPattern()) ||
-            index->descriptor()->unique();
-
-        options.dupsAllowed =
-            repl::getGlobalReplicationCoordinator()->shouldIgnoreUniqueIndex(index->descriptor())
-            || !isUnique;
+        options.dupsAllowed = isDupsAllowed( index->descriptor() );
 
         int64_t inserted;
         return index->accessMethod()->insert(txn, obj, loc, options, &inserted);
@@ -993,6 +1000,7 @@ namespace {
                                         bool logIfError) {
         InsertDeleteOptions options;
         options.logIfError = logIfError;
+        options.dupsAllowed = isDupsAllowed( index->descriptor() );
 
         int64_t removed;
         Status status = index->accessMethod()->remove(txn, obj, loc, options, &removed);

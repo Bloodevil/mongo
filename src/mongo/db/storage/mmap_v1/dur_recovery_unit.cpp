@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/dur_recovery_unit.h"
@@ -39,7 +41,7 @@
 #include "mongo/util/log.h"
 
 // Remove once we are ready to enable
-#define ROLLBACK_ENABLED 0
+#define ROLLBACK_ENABLED 1
 
 namespace mongo {
 
@@ -103,6 +105,11 @@ namespace mongo {
 #endif
     }
 
+    void DurRecoveryUnit::commitAndRestart() {
+        invariant( !inAUnitOfWork() );
+        // no-op since we have no transaction
+    }
+
     void DurRecoveryUnit::publishChanges() {
         if (!inAUnitOfWork())
             return;
@@ -157,15 +164,6 @@ namespace mongo {
         invariant(!inAUnitOfWork());
 #endif
         return getDur().awaitCommit();
-    }
-
-    bool DurRecoveryUnit::commitIfNeeded(bool force) {
-        // TODO this method will be going away completely soon. There is only one remaining caller.
-        invariant(force);
-#if ROLLBACK_ENABLED
-        publishChanges();
-#endif
-        return getDur().commitIfNeeded(_txn, force);
     }
 
     void* DurRecoveryUnit::writingPtr(void* data, size_t len) {

@@ -270,7 +270,7 @@ namespace mongo {
                                          bool preserveClonedFilesOnFailure,
                                          bool backupOriginalFiles ) {
         // We must hold some form of lock here
-        invariant(txn->lockState()->threadState());
+        invariant(txn->lockState()->isLocked());
         invariant( dbName.find( '.' ) == string::npos );
 
         scoped_ptr<RepairFileDeleter> repairFileDeleter;
@@ -306,8 +306,7 @@ namespace mongo {
                                                             reservedPath ) );
 
         {
-            Database* originalDatabase =
-                            dbHolder().get(txn, dbName);
+            Database* originalDatabase = dbHolder().openDb(txn, dbName);
             if (originalDatabase == NULL) {
                 return Status(ErrorCodes::NamespaceNotFound, "database does not exist to repair");
             }
@@ -320,17 +319,13 @@ namespace mongo {
             ON_BLOCK_EXIT(&RecoveryUnit::syncDataAndTruncateJournal, txn->recoveryUnit());
 
             {
-                WriteUnitOfWork wunit(txn);
                 dbEntry.reset(new MMAPV1DatabaseCatalogEntry(txn,
                                                              dbName,
                                                              reservedPathString,
                                                              storageGlobalParams.directoryperdb,
                                                              true));
                 invariant(!dbEntry->exists());
-                tempDatabase.reset( new Database(txn,
-                                                 dbName,
-                                                 dbEntry.get()));
-                wunit.commit();
+                tempDatabase.reset( new Database(dbName, dbEntry.get()));
             }
 
             map<string,CollectionOptions> namespacesToCopy;
@@ -341,7 +336,6 @@ namespace mongo {
                 if ( coll ) {
                     scoped_ptr<RecordIterator> it( coll->getIterator( txn,
                                                                       DiskLoc(),
-                                                                      false,
                                                                       CollectionScanParams::FORWARD ) );
                     while ( !it->isEOF() ) {
                         DiskLoc loc = it->getNext();
@@ -406,9 +400,7 @@ namespace mongo {
                         return status;
                 }
 
-                scoped_ptr<RecordIterator> iterator(
-                    originalCollection->getIterator( txn, DiskLoc(), false,
-                                                     CollectionScanParams::FORWARD ));
+                scoped_ptr<RecordIterator> iterator(originalCollection->getIterator(txn));
                 while ( !iterator->isEOF() ) {
                     DiskLoc loc = iterator->getNext();
                     invariant( !loc.isNull() );
@@ -452,7 +444,8 @@ namespace mongo {
         if ( repairFileDeleter.get() )
             repairFileDeleter->success();
 
-        dbHolder().close( txn, dbName );
+        // Close the database so we can rename/delete the original data files
+        dbHolder().close(txn, dbName);
 
         if ( backupOriginalFiles ) {
             _renameForBackup( dbName, reservedPath );
@@ -474,8 +467,12 @@ namespace mongo {
 
         _replaceWithRecovered( dbName, reservedPathString.c_str() );
 
-        if ( !backupOriginalFiles )
-            MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::remove_all( reservedPath ) );
+        if (!backupOriginalFiles) {
+            MONGO_ASSERT_ON_EXCEPTION(boost::filesystem::remove_all(reservedPath));
+        }
+
+        // Reopen the database so it's discoverable
+        dbHolder().openDb(txn, dbName);
 
         return Status::OK();
     }

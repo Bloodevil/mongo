@@ -28,6 +28,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/db/matcher/expression_parser.h"
 
 #include "mongo/base/init.h"
@@ -43,9 +45,9 @@ namespace mongo {
                                                                const BSONObj& section ) {
         if (BSONObj::opWITHIN == type || BSONObj::opGEO_INTERSECTS == type) {
             auto_ptr<GeoExpression> gq(new GeoExpression(name));
-            if ( !gq->parseFrom( section ) )
-                return StatusWithMatchExpression( ErrorCodes::BadValue,
-                                                  string("bad geo query: ") + section.toString() );
+            Status parseStatus = gq->parseFrom(section);
+
+            if (!parseStatus.isOK()) return StatusWithMatchExpression(parseStatus);
 
             auto_ptr<GeoMatchExpression> e( new GeoMatchExpression() );
 

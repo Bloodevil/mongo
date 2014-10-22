@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+
 #include "mongo/db/auth/authz_manager_external_state_local.h"
 
 #include "mongo/base/status.h"
@@ -208,6 +210,22 @@ namespace {
         }
         *result = resultDoc.getObject();
         return Status::OK();
+    }
+
+    Status AuthzManagerExternalStateLocal::_getUserDocument(OperationContext* txn,
+                                                            const UserName& userName,
+                                                            BSONObj* userDoc) {
+        Status status = findOne(
+                txn,
+                AuthorizationManager::usersCollectionNamespace,
+                BSON(AuthorizationManager::USER_NAME_FIELD_NAME << userName.getUser() <<
+                     AuthorizationManager::USER_DB_FIELD_NAME << userName.getDB()),
+                userDoc);
+        if (status == ErrorCodes::NoMatchingDocument) {
+            status = Status(ErrorCodes::UserNotFound, mongoutils::str::stream() <<
+                            "Could not find user " << userName.getFullName());
+        }
+        return status;
     }
 
     Status AuthzManagerExternalStateLocal::getRoleDescription(const RoleName& roleName,

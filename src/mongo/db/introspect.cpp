@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/pch.h"
 
 #include "mongo/bson/util/builder.h"
@@ -135,11 +137,17 @@ namespace {
         BufBuilder profileBufBuilder(1024);
 
         try {
-            // NOTE: It's kind of weird that we lock the op's namespace, but have to for now since
-            // we're sometimes inside the lock already
-            Lock::DBWrite lk(txn->lockState(), currentOp.getNS() );
-            if (dbHolder().get(txn, nsToDatabase(currentOp.getNS())) != NULL) {
+            // NOTE: It's kind of weird that we lock the op's namespace, but have to for now
+            // since we're sometimes inside the lock already
+            const string dbname(nsToDatabase(currentOp.getNS()));
+            scoped_ptr<Lock::DBLock> lk;
+            if ( !txn->lockState()->isDbLockedForMode( dbname, MODE_IX ) ) {
+                lk.reset( new Lock::DBLock( txn->lockState(), dbname, MODE_IX) );
+            }
+            Database* db = dbHolder().get(txn, dbname);
+            if (db != NULL) {
                 // We are ok with the profiling happening in a different WUOW from the actual op.
+                Lock::CollectionLock clk(txn->lockState(), db->getProfilingNS(), MODE_X);
                 WriteUnitOfWork wunit(txn);
                 Client::Context cx(txn, currentOp.getNS(), false);
                 _profile(txn, c, cx.db(), currentOp, profileBufBuilder);
@@ -195,8 +203,11 @@ namespace {
         collectionOptions.capped = true;
         collectionOptions.cappedSize = 1024 * 1024;
 
+        WriteUnitOfWork wunit(txn);
         collection = db->createCollection( txn, profileName, collectionOptions );
         invariant( collection );
+        wunit.commit();
+
         return collection;
     }
 

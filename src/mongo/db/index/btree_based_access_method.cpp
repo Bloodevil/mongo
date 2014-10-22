@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+
 #include "mongo/db/index/btree_access_method.h"
 
 #include <vector>
@@ -108,7 +110,7 @@ namespace mongo {
 
             // Clean up after ourselves.
             for (BSONObjSet::const_iterator j = keys.begin(); j != i; ++j) {
-                removeOneKey(txn, *j, loc);
+                removeOneKey(txn, *j, loc, options.dupsAllowed);
                 *numInserted = 0;
             }
 
@@ -122,13 +124,12 @@ namespace mongo {
         return ret;
     }
 
-    bool BtreeBasedAccessMethod::removeOneKey(OperationContext* txn,
+    void BtreeBasedAccessMethod::removeOneKey(OperationContext* txn,
                                               const BSONObj& key,
-                                              const DiskLoc& loc) {
-        bool ret = false;
-
+                                              const DiskLoc& loc,
+                                              bool dupsAllowed) {
         try {
-            ret = _newInterface->unindex(txn, key, loc);
+            _newInterface->unindex(txn, key, loc, dupsAllowed);
         } catch (AssertionException& e) {
             log() << "Assertion failure: _unindex failed "
                   << _descriptor->indexNamespace() << endl;
@@ -137,8 +138,6 @@ namespace mongo {
             log() << "  dl:" << loc.toString() << endl;
             logContext();
         }
-
-        return ret;
     }
 
     Status BtreeBasedAccessMethod::newCursor(OperationContext* txn, const CursorOptions& opts, IndexCursor** out) const {
@@ -158,14 +157,8 @@ namespace mongo {
         *numDeleted = 0;
 
         for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
-            bool thisKeyOK = removeOneKey(txn, *i, loc);
-
-            if (thisKeyOK) {
-                ++*numDeleted;
-            } else if (options.logIfError) {
-                log() << "unindex failed (key too big?) " << _descriptor->indexNamespace()
-                      << " key: " << *i;
-            }
+            removeOneKey(txn, *i, loc, options.dupsAllowed);
+            ++*numDeleted;
         }
 
         return Status::OK();
@@ -295,7 +288,10 @@ namespace mongo {
         }
 
         for (size_t i = 0; i < data->removed.size(); ++i) {
-            _newInterface->unindex(txn, *data->removed[i], data->loc);
+            _newInterface->unindex(txn,
+                                   *data->removed[i],
+                                   data->loc,
+                                   data->dupsAllowed);
         }
 
         for (size_t i = 0; i < data->added.size(); ++i) {

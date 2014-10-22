@@ -30,12 +30,14 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/exec/multi_plan.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/util/mongoutils/str.h"
-
 #include <algorithm>
 #include <math.h>
+
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/exec/working_set_common.h"
+#include "mongo/util/mongoutils/str.h"
 
 // for updateCache
 #include "mongo/db/catalog/collection.h"
@@ -69,12 +71,6 @@ namespace mongo {
         for (size_t ix = 0; ix < _candidates.size(); ++ix) {
             delete _candidates[ix].solution;
             delete _candidates[ix].root;
-        }
-
-        for (vector<PlanStageStats*>::iterator it = _candidateStats.begin();
-             it != _candidateStats.end();
-             ++it) {
-            delete *it;
         }
     }
 
@@ -152,7 +148,7 @@ namespace mongo {
         return state;
     }
 
-    void MultiPlanStage::pickBestPlan() {
+    Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
         // execution work that happens here, so this is needed for the time accounting to
         // make sense.
@@ -186,11 +182,28 @@ namespace mongo {
         // Work the plans, stopping when a plan hits EOF or returns some
         // fixed number of results.
         for (size_t ix = 0; ix < numWorks; ++ix) {
+            // Yield, if it's time to yield.
+            if (NULL != yieldPolicy && yieldPolicy->shouldYield()) {
+                bool alive = yieldPolicy->yield();
+                if (!alive) {
+                    _failure = true;
+                    Status failStat(ErrorCodes::OperationFailed,
+                                    "PlanExecutor killed during plan selection");
+                    _statusMemberId = WorkingSetCommon::allocateStatusMember(_candidates[0].ws,
+                                                                             failStat);
+                    return failStat;
+                }
+            }
+
             bool moreToDo = workAllPlans(numResults);
             if (!moreToDo) { break; }
         }
 
-        if (_failure) { return; }
+        if (_failure) {
+            invariant(WorkingSet::INVALID_ID != _statusMemberId);
+            WorkingSetMember* member = _candidates[0].ws->get(_statusMemberId);
+            return WorkingSetCommon::getMemberStatus(*member);
+        }
 
         // After picking best plan, ranking will own plan stats from
         // candidate solutions (winner and losers).
@@ -294,23 +307,24 @@ namespace mongo {
                 _collection->infoCache()->getPlanCache()->add(*_query, solutions, ranking.release());
             }
         }
+
+        return Status::OK();
     }
 
     vector<PlanStageStats*> MultiPlanStage::generateCandidateStats() {
+        OwnedPointerVector<PlanStageStats> candidateStats;
+
         for (size_t ix = 0; ix < _candidates.size(); ix++) {
             if (ix == (size_t)_bestPlanIdx) { continue; }
             if (ix == (size_t)_backupPlanIdx) { continue; }
 
-            // Remember the stats for the candidate plan because we always show it on an
-            // explain. (The {verbose:false} in explain() is client-side trick; we always
-            // generate a "verbose" explain.)
             PlanStageStats* stats = _candidates[ix].root->getStats();
             if (stats) {
-                _candidateStats.push_back(stats);
+                candidateStats.push_back(stats);
             }
         }
 
-        return _candidateStats;
+        return candidateStats.release();
     }
 
     bool MultiPlanStage::workAllPlans(size_t numResults) {
@@ -346,8 +360,6 @@ namespace mongo {
 
                 // Propagate most recent seen failure to parent.
                 if (PlanStage::FAILURE == state) {
-                    BSONObj objOut;
-                    WorkingSetCommon::getStatusMemberObject(*candidate.ws, id, &objOut);
                     _statusMemberId = id;
                 }
 
@@ -361,71 +373,17 @@ namespace mongo {
         return !doneWorking;
     }
 
-    Status MultiPlanStage::executeAllPlans() {
-        // Boolean vector keeping track of which plans are done.
-        vector<bool> planDone(_candidates.size(), false);
-
-        // Number of plans that are done.
-        size_t doneCount = 0;
-
-        while (doneCount < _candidates.size()) {
-            for (size_t i = 0; i < _candidates.size(); i++) {
-                if (planDone[i]) {
-                    continue;
-                }
-
-                WorkingSetID id = WorkingSet::INVALID_ID;
-                PlanStage::StageState state = _candidates[i].root->work(&id);
-
-                if (PlanStage::IS_EOF == state || PlanStage::DEAD == state) {
-                    doneCount++;
-                    planDone[i] = true;
-                }
-                else if (PlanStage::FAILURE == state) {
-                    // Propogate error.
-                    BSONObj errObj;
-                    WorkingSetCommon::getStatusMemberObject(*_candidates[i].ws, id, &errObj);
-                    return Status(ErrorCodes::BadValue, WorkingSetCommon::toStatusString(errObj));
-                }
-            }
-        }
-
-        return Status::OK();
-    }
-
     void MultiPlanStage::saveState() {
-        if (_failure) return;
-
-        // this logic is from multi_plan_runner
-        // but does it really make sense to operate on
-        // the _bestPlan if we've switched to the backup?
-
-        if (bestPlanChosen()) {
-            _candidates[_bestPlanIdx].root->saveState();
-            if (hasBackupPlan()) {
-                _candidates[_backupPlanIdx].root->saveState();
-            }
-        }
-        else {
-            allPlansSaveState();
+        for (size_t i = 0; i < _candidates.size(); ++i) {
+            _candidates[i].root->saveState();
         }
     }
 
     void MultiPlanStage::restoreState(OperationContext* opCtx) {
-        if (_failure) return;
+        _txn = opCtx;
 
-        // this logic is from multi_plan_runner
-        // but does it really make sense to operate on
-        // the _bestPlan if we've switched to the backup?
-
-        if (bestPlanChosen()) {
-            _candidates[_bestPlanIdx].root->restoreState(opCtx);
-            if (hasBackupPlan()) {
-                _candidates[_backupPlanIdx].root->restoreState(opCtx);
-            }
-        }
-        else {
-            allPlansRestoreState(opCtx);
+        for (size_t i = 0; i < _candidates.size(); ++i) {
+            _candidates[i].root->restoreState(opCtx);
         }
     }
 
@@ -492,18 +450,6 @@ namespace mongo {
             return NULL;
 
         return _candidates[_bestPlanIdx].solution;
-    }
-
-    void MultiPlanStage::allPlansSaveState() {
-        for (size_t i = 0; i < _candidates.size(); ++i) {
-            _candidates[i].root->saveState();
-        }
-    }
-
-    void MultiPlanStage::allPlansRestoreState(OperationContext* opCtx) {
-        for (size_t i = 0; i < _candidates.size(); ++i) {
-            _candidates[i].root->restoreState(opCtx);
-        }
     }
 
     vector<PlanStage*> MultiPlanStage::getChildren() const {

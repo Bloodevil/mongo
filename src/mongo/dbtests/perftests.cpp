@@ -34,6 +34,8 @@
  *    then also delete it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -42,19 +44,18 @@
 #include <fstream>
 
 #include "mongo/db/db.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/json.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
-#include "mongo/db/instance.h"
-#include "mongo/db/json.h"
 #include "mongo/db/storage/mmap_v1/btree/key.h"
-#include "mongo/db/lasterror.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
-#include "mongo/util/concurrency/qlock.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
@@ -72,13 +73,15 @@ namespace PerfTests {
 
     class ClientBase {
     public:
-        // NOTE: Not bothering to backup the old error record.
         ClientBase() : _client(&_txn) {
-            mongo::lastError.reset(new LastError());
+            _prevError = mongo::lastError._get( false );
+            mongo::lastError.release();
+            mongo::lastError.reset( new LastError() );
         }
         virtual ~ClientBase() {
-
+            mongo::lastError.reset( _prevError );
         }
+
     protected:
         void insert( const char *ns, BSONObj o ) {
             _client.insert( ns, o );
@@ -93,6 +96,7 @@ namespace PerfTests {
         DBClientBase* client() { return &_client; }
 
     private:
+        LastError* _prevError;
         OperationContextImpl _txn;
         DBDirectClient _client;
     };
@@ -630,42 +634,6 @@ namespace PerfTests {
         }
     };
 
-    QLock _qlock;
-
-    class qlock : public B {
-    public:
-        string name() { return "qlockr"; }
-        //virtual int howLongMillis() { return 500; }
-        virtual bool showDurStats() { return false; }
-        void timed() {
-            _qlock.lock_r();
-            _qlock.unlock_r();
-        }
-    };
-    class qlockw : public B {
-    public:
-        string name() { return "qlockw"; }
-        //virtual int howLongMillis() { return 500; }
-        virtual bool showDurStats() { return false; }
-        void timed() {
-            _qlock.lock_w();
-            _qlock.unlock_w();
-        }
-    };
-
-#if 0
-    class ulock : public B {
-    public:
-        string name() { return "ulock"; }
-        virtual int howLongMillis() { return 500; }
-        virtual bool showDurStats() { return false; }
-        void timed() {
-            lk.lockAsUpgradable();
-            lk.unlockFromUpgradable();
-        }
-    };
-#endif
-
     class CTM : public B {
     public:
         CTM() : last(0), delts(0), n(0) { }
@@ -786,8 +754,7 @@ namespace PerfTests {
         virtual int howLongMillis() { return 3000; }
         string name() { return "thread-local-storage"; }
         void timed() {
-            if( &cc() )
-                dontOptimizeOutHopefully++;
+            dontOptimizeOutHopefully++;
         }
         virtual bool showDurStats() { return false; }
     };
@@ -1376,8 +1343,6 @@ namespace PerfTests {
 #endif
                 add< rlock >();
                 add< wlock >();
-                add< qlock >();
-                add< qlockw >();
                 add< NotifyOne >();
                 add< mutexspeed >();
                 add< simplemutexspeed >();

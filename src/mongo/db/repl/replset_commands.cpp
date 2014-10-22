@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+
 #include "mongo/pch.h"
 
 #include "mongo/base/init.h"
@@ -47,7 +49,6 @@
 namespace mongo {
 namespace repl {
 
-    bool replSetBlind = false;
     unsigned replSetForceInitialSyncFailure = 0;
 
     // Testing only, enabled via command-line.
@@ -72,16 +73,6 @@ namespace repl {
             Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
             if (!status.isOK())
                 return appendCommandStatus(result, status);
-
-            if( cmdObj.hasElement("blind") ) {
-                replSetBlind = cmdObj.getBoolField("blind");
-                return true;
-            }
-
-            if (cmdObj.hasElement("sethbmsg")) {
-                sethbmsg(cmdObj["sethbmsg"].String());
-                return true;
-            }
 
             return false;
         }
@@ -209,6 +200,11 @@ namespace repl {
         }
     private:
         bool _run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
             if( cmdObj["replSetReconfig"].type() != Object ) {
                 errmsg = "no configuration specified";
                 return false;
@@ -217,9 +213,13 @@ namespace repl {
             ReplicationCoordinator::ReplSetReconfigArgs parsedArgs;
             parsedArgs.newConfigObj =  cmdObj["replSetReconfig"].Obj();
             parsedArgs.force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
-            Status status = getGlobalReplicationCoordinator()->processReplSetReconfig(txn,
-                                                                                      parsedArgs,
-                                                                                      &result);
+            status = getGlobalReplicationCoordinator()->processReplSetReconfig(txn,
+                                                                               parsedArgs,
+                                                                               &result);
+            if (status.isOK() && !parsedArgs.force) {
+                logOpInitiate(txn, BSON("msg" << "Reconfig set" << 
+                                        "version" << parsedArgs.newConfigObj["version"]));
+            }
             return appendCommandStatus(result, status);
         }
     } cmdReplSetReconfig;
@@ -310,10 +310,9 @@ namespace repl {
 
             return appendCommandStatus(
                     result,
-                    getGlobalReplicationCoordinator()->processReplSetMaintenance(
+                    getGlobalReplicationCoordinator()->setMaintenanceMode(
                             txn,
-                            cmdObj["replSetMaintenance"].trueValue(),
-                            &result));
+                            cmdObj["replSetMaintenance"].trueValue()));
         }
     } cmdReplSetMaintenance;
 

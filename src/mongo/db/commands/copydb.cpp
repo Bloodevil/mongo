@@ -48,7 +48,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
@@ -151,6 +150,11 @@ namespace mongo {
                 return false;
             }
 
+            if ( !NamespaceString::validDBName( todb ) ) {
+                errmsg = "invalid todb name: " + todb;
+                return false;
+            }
+
             Cloner cloner;
             string username = cmdObj.getStringField( "username" );
             string nonce = cmdObj.getStringField( "nonce" );
@@ -183,15 +187,14 @@ namespace mongo {
                 cloner.setConnection(conn);
             }
 
-
-            // SERVER-4328 todo lock just the two db's not everything for the fromself case
-            scoped_ptr<Lock::ScopedLock> lk( fromSelf ?
-                                             static_cast<Lock::ScopedLock*>(new Lock::GlobalWrite(txn->lockState())) :
-                                             static_cast<Lock::ScopedLock*>(new Lock::DBWrite(txn->lockState(), todb)));
-            if (!cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg )) {
-                return false;
+            if (fromSelf) {
+                // SERVER-4328 todo lock just the two db's not everything for the fromself case
+                Lock::GlobalWrite lk(txn->lockState());
+                return cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg);
             }
-            return true;
+
+            Lock::DBLock lk (txn->lockState(), todb, MODE_X);
+            return cloner.go(txn, todb, fromhost, cloneOptions, NULL, errmsg);
         }
 
     } cmdCopyDB;

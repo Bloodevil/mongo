@@ -41,6 +41,7 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/handshake_args.h"
+#include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/member.h"
 #include "mongo/db/repl/oplog.h" // for newRepl()
@@ -60,14 +61,13 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
 
 namespace mongo {
 
 namespace repl {
 
     LegacyReplicationCoordinator::LegacyReplicationCoordinator(const ReplSettings& settings) :
-            _settings(settings) {
+            _maintenanceMode(0), _settings(settings) {
         // this is ok but micros or combo with some rand() and/or 64 bits might be better --
         // imagine a restart and a clock correction simultaneously (very unlikely but possible...)
         _rbid = (int) curTimeMillis64();
@@ -99,9 +99,6 @@ namespace repl {
     }
 
     void LegacyReplicationCoordinator::shutdown() {
-        if (getReplicationMode() == modeReplSet) {
-            theReplSet->shutdown();
-        }
     }
 
     ReplSettings& LegacyReplicationCoordinator::getSettings() {
@@ -120,6 +117,15 @@ namespace repl {
     MemberState LegacyReplicationCoordinator::getCurrentMemberState() const {
         invariant(getReplicationMode() == modeReplSet);
         return theReplSet->state();
+    }
+
+    Seconds LegacyReplicationCoordinator::getSlaveDelaySecs() const {
+        invariant(getReplicationMode() == modeReplSet);
+        return Seconds(theReplSet->myConfig().slaveDelay);
+    }
+
+    void LegacyReplicationCoordinator::clearSyncSourceBlacklist() {
+        theReplSet->clearVetoes();
     }
 
     ReplicationCoordinator::StatusAndDuration LegacyReplicationCoordinator::awaitReplication(
@@ -142,6 +148,11 @@ namespace repl {
 
         if (writeConcern.wMode == "majority" && replMode == modeMasterSlave) {
             // with master/slave, majority is equivalent to w=1
+            return StatusAndDuration(Status::OK(), Milliseconds(timeoutTimer.millis()));
+        }
+
+        if (ts.isNull()) {
+            // If waiting for the empty optime, always say it's been replicated.
             return StatusAndDuration(Status::OK(), Milliseconds(timeoutTimer.millis()));
         }
 
@@ -179,26 +190,18 @@ namespace repl {
         }
     }
 
-    ReplicationCoordinator::StatusAndDuration 
-            LegacyReplicationCoordinator::awaitReplicationOfLastOp(
+    ReplicationCoordinator::StatusAndDuration
+            LegacyReplicationCoordinator::awaitReplicationOfLastOpForClient(
                     const OperationContext* txn,
                     const WriteConcernOptions& writeConcern) {
-        return awaitReplication(txn, cc().getLastOp(), writeConcern);
+        return awaitReplication(txn, txn->getClient()->getLastOp(), writeConcern);
     }
 
-    Status LegacyReplicationCoordinator::stepDown(OperationContext* txn, 
-                                                  bool force,
-                                                  const Milliseconds& waitTime,
-                                                  const Milliseconds& stepdownTime) {
-        return _stepDownHelper(txn, force, waitTime, stepdownTime, Milliseconds(0));
-    }
-
-    Status LegacyReplicationCoordinator::stepDownAndWaitForSecondary(
-            OperationContext* txn,
-            const Milliseconds& initialWaitTime,
-            const Milliseconds& stepdownTime,
-            const Milliseconds& postStepdownWaitTime) {
-        return _stepDownHelper(txn, false, initialWaitTime, stepdownTime, postStepdownWaitTime);
+    ReplicationCoordinator::StatusAndDuration
+            LegacyReplicationCoordinator::awaitReplicationOfLastOpApplied(
+                    const OperationContext* txn,
+                    const WriteConcernOptions& writeConcern) {
+        return awaitReplication(txn, theReplSet->lastOpTimeWritten, writeConcern);
     }
 
 namespace {
@@ -244,18 +247,17 @@ namespace {
     }
 } // namespace
 
-    Status LegacyReplicationCoordinator::_stepDownHelper(OperationContext* txn,
-                                                         bool force,
-                                                         const Milliseconds& initialWaitTime,
-                                                         const Milliseconds& stepdownTime,
-                                                         const Milliseconds& postStepdownWaitTime) {
+    Status LegacyReplicationCoordinator::stepDown(OperationContext* txn,
+                                                  bool force,
+                                                  const Milliseconds& waitTime,
+                                                  const Milliseconds& stepdownTime) {
         invariant(getReplicationMode() == modeReplSet);
         if (!getCurrentMemberState().primary()) {
             return Status(ErrorCodes::NotMaster, "not primary so can't step down");
         }
 
         if (!force) {
-            Status status = _waitForSecondary(initialWaitTime, Milliseconds(10 * 1000));
+            Status status = _waitForSecondary(waitTime, Milliseconds(10 * 1000));
             if (!status.isOK()) {
                 return status;
             }
@@ -265,16 +267,6 @@ namespace {
         bool worked = repl::theReplSet->stepDown(txn, stepdownTime.total_seconds());
         if (!worked) {
             return Status(ErrorCodes::NotMaster, "not primary so can't step down");
-        }
-
-        if (postStepdownWaitTime.total_milliseconds() > 0) {
-            log() << "waiting for secondaries to catch up" << endl;
-
-            // The only caller of this with a non-zero postStepdownWaitTime is
-            // stepDownAndWaitForSecondary, and the only caller of that is the shutdown command
-            // which doesn't actually care if secondaries failed to catch up here, so we ignore the
-            // return status of _waitForSecondary
-            _waitForSecondary(postStepdownWaitTime, Milliseconds(0));
         }
         return Status::OK();
     }
@@ -330,9 +322,9 @@ namespace {
         return dbName == "local";
     }
 
-    Status LegacyReplicationCoordinator::canServeReadsFor(OperationContext* txn,
-                                                          const NamespaceString& ns,
-                                                          bool slaveOk) {
+    Status LegacyReplicationCoordinator::checkCanServeReadsFor(OperationContext* txn,
+                                                               const NamespaceString& ns,
+                                                               bool slaveOk) {
         if (txn->isGod()) {
             return Status::OK();
         }
@@ -371,11 +363,6 @@ namespace {
                (ms == MemberState::RS_ROLLBACK))) {
             return false;
         }
-        // 2 is the oldest oplog version where operations
-        // are fully idempotent.
-        if (theReplSet->oplogVersion < 2) {
-            return false;
-        }
         // Never ignore _id index
         if (idx->isIdIndex()) {
             return false;
@@ -384,27 +371,28 @@ namespace {
         return true;
     }
 
-    Status LegacyReplicationCoordinator::setMyLastOptime(OperationContext* txn, const OpTime& ts) {
-        return setLastOptime(txn, getMyRID(), ts);
-    }
-
     Status LegacyReplicationCoordinator::setLastOptime(OperationContext* txn,
                                                        const OID& rid,
                                                        const OpTime& ts) {
         {
             boost::lock_guard<boost::mutex> lock(_mutex);
-            if (ts <= mapFindWithDefault(_slaveOpTimeMap, rid, OpTime())) {
-                // Only update if ts is newer than what we have already
-                return Status::OK();
-            }
+            SlaveOpTimeMap::const_iterator it(_slaveOpTimeMap.find(rid));
 
             if (rid != getMyRID()) {
+                if ((it != _slaveOpTimeMap.end()) && (ts <= it->second)) {
+                    // Only update if ts is newer than what we have already
+                    return Status::OK();
+                }
+
                 BSONObj config;
                 if (getReplicationMode() == modeReplSet) {
                     invariant(_ridMemberMap.count(rid));
                     Member* mem = _ridMemberMap[rid];
                     invariant(mem);
-                    config = BSON("_id" << mem->id());
+                    config = BSON("_id" << mem->id() << "host" << mem->h().toString());
+                }
+                else if (getReplicationMode() == modeMasterSlave){
+                    config = BSON("host" << txn->getClient()->getRemote().toString());
                 }
                 LOG(2) << "received notification that node with RID " << rid << " and config "
                        << config << " has reached optime: " << ts;
@@ -414,8 +402,9 @@ namespace {
                 if (!updateSlaveTracking(BSON("_id" << rid), config, ts)) {
                     return Status(ErrorCodes::NodeNotFound,
                                   str::stream() << "could not update node with _id: "
-                                          << config["_id"].Int()
-                                          << " because it cannot be found in current ReplSetConfig");
+                                          << config["_id"].Int() << " and RID " << rid
+                                          << " because it cannot be found in current ReplSetConfig "
+                                          << theReplSet->getConfig().toString());
                 }
             }
 
@@ -432,14 +421,67 @@ namespace {
         }
         return Status::OK();
     }
+
+    Status LegacyReplicationCoordinator::setMyLastOptime(OperationContext* txn, const OpTime& ts) {
+        if (getReplicationMode() == modeReplSet) {
+            theReplSet->lastOpTimeWritten = ts;
+        }
+        return setLastOptime(txn, _myRID, ts);
+    }
+
+    OpTime LegacyReplicationCoordinator::getMyLastOptime() const {
+        boost::lock_guard<boost::mutex> lock(_mutex);
+
+        SlaveOpTimeMap::const_iterator it(_slaveOpTimeMap.find(_myRID));
+        if (it == _slaveOpTimeMap.end()) {
+            return OpTime(0,0);
+        }
+        OpTime legacyMapOpTime = it->second;
+        OpTime legacyOpTime = theReplSet->lastOpTimeWritten;
+        // TODO(emilkie): SERVER-15209 
+        // This currently fails because a PRIMARY can see an old optime for itself
+        // come through the spanning tree, which updates the slavemap but not the variable.
+        // replsets_priority1.js is a test that hits this condition (sometimes) and fails.
+        //fassert(18695, legacyOpTime == legacyMapOpTime);
+        return legacyOpTime;
+    }
     
     OID LegacyReplicationCoordinator::getElectionId() {
         return theReplSet->getElectionId();
     }
 
 
-    OID LegacyReplicationCoordinator::getMyRID() {
+    OID LegacyReplicationCoordinator::getMyRID() const {
         return _myRID;
+    }
+
+    int LegacyReplicationCoordinator::getMyId() const {
+        invariant(theReplSet);
+        return theReplSet->myConfig()._id;
+    }
+
+    bool LegacyReplicationCoordinator::setFollowerMode(const MemberState& newState) {
+        if (newState.secondary() &&
+                theReplSet->state().recovering() &&
+                theReplSet->mgr->shouldBeRecoveringDueToAuthIssue()) {
+            // If tryToGoLiveAsSecondary is trying to take us from RECOVERING to SECONDARY, but we
+            // still have an authIssue, don't actually change states.
+            return false;
+        }
+        theReplSet->changeState(newState);
+        return true;
+    }
+
+    bool LegacyReplicationCoordinator::isWaitingForApplierToDrain() {
+        return BackgroundSync::get()->isAssumingPrimary_inlock();
+    }
+
+    void LegacyReplicationCoordinator::signalDrainComplete() {
+        // nothing further to do
+    }
+
+    void LegacyReplicationCoordinator::signalUpstreamUpdater() {
+        theReplSet->syncSourceFeedback.forwardSlaveHandshake();
     }
 
     void LegacyReplicationCoordinator::prepareReplSetUpdatePositionCommand(
@@ -507,15 +549,75 @@ namespace {
 
     Status LegacyReplicationCoordinator::processReplSetGetStatus(BSONObjBuilder* result) {
         theReplSet->summarizeStatus(*result);
+        // NOTE: The following field is for debugging only and not part of the interface.
+        result->append("replCoord", "legacy");
         return Status::OK();
+    }
+
+    void LegacyReplicationCoordinator::fillIsMasterForReplSet(IsMasterResponse* result) {
+        invariant(getSettings().usingReplSets());
+        if (getReplicationMode() != ReplicationCoordinator::modeReplSet
+                || getCurrentMemberState().removed()) {
+            result->markAsNoConfig();
+        }
+        else {
+            BSONObjBuilder resultBuilder;
+            theReplSet->fillIsMaster(resultBuilder);
+            Status status = result->initialize(resultBuilder.done());
+            fassert(18821, status);
+        }
     }
 
     void LegacyReplicationCoordinator::processReplSetGetConfig(BSONObjBuilder* result) {
         result->append("config", theReplSet->config().asBson());
     }
 
-    bool LegacyReplicationCoordinator::setMaintenanceMode(OperationContext* txn, bool activate) {
-        return theReplSet->setMaintenanceMode(txn, activate);
+    bool LegacyReplicationCoordinator::_setMaintenanceMode_inlock(OperationContext* txn,
+                                                                  bool activate) {
+        if (theReplSet->state().primary()) {
+            return false;
+        }
+
+        if (activate) {
+            log() << "replSet going into maintenance mode (" << _maintenanceMode
+                  << " other tasks)" << rsLog;
+
+            _maintenanceMode++;
+            theReplSet->changeState(MemberState::RS_RECOVERING);
+        }
+        else if (_maintenanceMode > 0) {
+            _maintenanceMode--;
+            // no need to change state, syncTail will try to go live as a secondary soon
+
+            log() << "leaving maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
+        }
+        else {
+            return false;
+        }
+
+        fassert(16844, _maintenanceMode >= 0);
+        return true;
+    }
+
+    Status LegacyReplicationCoordinator::setMaintenanceMode(OperationContext* txn, bool activate) {
+        // Lock here to prevent state from changing between checking the state and changing it
+        Lock::GlobalWrite writeLock(txn->lockState());
+        boost::lock_guard<boost::mutex> lock(_mutex);
+
+        if (!_setMaintenanceMode_inlock(txn, activate)) {
+            if (theReplSet->isPrimary()) {
+                return Status(ErrorCodes::NotSecondary, "primaries can't modify maintenance mode");
+            }
+            else {
+                return Status(ErrorCodes::OperationFailed, "already out of maintenance mode");
+            }
+        }
+        return Status::OK();
+    }
+
+    bool LegacyReplicationCoordinator::getMaintenanceMode() {
+        boost::lock_guard<boost::mutex> lock(_mutex);
+        return _maintenanceMode > 0;
     }
 
     Status LegacyReplicationCoordinator::processHeartbeat(const ReplSetHeartbeatArgs& args,
@@ -530,7 +632,8 @@ namespace {
                       << rsLog;
                 log() << "replSet s: " << args.getSetName() << rsLog;
                 response->noteMismatched();
-                return Status(ErrorCodes::BadValue, "repl set names do not match");
+                return Status(ErrorCodes::InconsistentReplicaSetNames,
+                              "repl set names do not match");
             }
         }
 
@@ -546,7 +649,8 @@ namespace {
 
         if (theReplSet->name() != args.getSetName()) {
             response->noteMismatched();
-            return Status(ErrorCodes::BadValue, "repl set names do not match (2)");
+            return Status(ErrorCodes::InconsistentReplicaSetNames,
+                          "repl set names do not match (2)");
         }
         response->setSetName(theReplSet->name());
 
@@ -560,9 +664,9 @@ namespace {
         response->setHbMsg(theReplSet->hbmsg());
         response->setTime(Seconds(time(0)));
         response->setOpTime(theReplSet->lastOpTimeWritten.asDate());
-        const Member *syncTarget = BackgroundSync::get()->getSyncTarget();
-        if (syncTarget) {
-            response->setSyncingTo(syncTarget->fullName());
+        const HostAndPort syncTarget = BackgroundSync::get()->getSyncTarget();
+        if (!syncTarget.empty()) {
+            response->setSyncingTo(syncTarget.toString());
         }
 
         int v = theReplSet->config().version;
@@ -620,21 +724,6 @@ namespace {
                                                                 const ReplSetReconfigArgs& args,
                                                                 BSONObjBuilder* resultObj) {
 
-        if( args.force && !theReplSet ) {
-            _settings.reconfig = args.newConfigObj.getOwned();
-            resultObj->append("msg",
-                              "will try this config momentarily, try running rs.conf() again in a "
-                                      "few seconds");
-            return Status::OK();
-        }
-
-        // TODO(dannenberg) once reconfig processing has been figured out in the impl, this should
-        // be moved out of processReplSetReconfig and into the command body like all other cmds
-        Status status = checkReplEnabledForCommand(resultObj);
-        if (!status.isOK()) {
-            return status;
-        }
-
         if( !args.force && !theReplSet->box.getState().primary() ) {
             return Status(ErrorCodes::NotMaster,
                           "replSetReconfig command must be sent to the current replica set "
@@ -657,7 +746,7 @@ namespace {
             }
 
 
-            scoped_ptr<ReplSetConfig> newConfig(ReplSetConfig::make(args.newConfigObj, args.force));
+            scoped_ptr<ReplSetConfig> newConfig(ReplSetConfig::make(txn, args.newConfigObj, args.force));
 
             log() << "replSet replSetReconfig config object parses ok, " <<
                     newConfig->members.size() << " members specified" << rsLog;
@@ -671,7 +760,7 @@ namespace {
 
             log() << "replSet replSetReconfig [2]" << rsLog;
 
-            theReplSet->haveNewConfig(txn, *newConfig, true);
+            theReplSet->haveNewConfig(txn, *newConfig, false);
             ReplSet::startupStatusMsg.set("replSetReconfig'd");
         }
         catch(const DBException& e) {
@@ -716,7 +805,7 @@ namespace {
                    it is ok if the initiating member has *other* data than that.
                    */
                 BSONObj o;
-                if( Helpers::getFirst(txn, rsoplog, o) ) {
+                if (Helpers::getSingleton(txn, rsoplog, o)) {
                     return Status(ErrorCodes::AlreadyInitialized,
                                   rsoplog + string(" is not empty on the initiating member.  "
                                           "cannot initiate."));
@@ -737,7 +826,7 @@ namespace {
 
             scoped_ptr<ReplSetConfig> newConfig;
             try {
-                newConfig.reset(ReplSetConfig::make(configObj));
+                newConfig.reset(ReplSetConfig::make(txn, configObj));
             } catch (const DBException& e) {
                 log() << "replSet replSetInitiate exception: " << e.what() << rsLog;
                 return Status(ErrorCodes::InvalidReplicaSetConfig,
@@ -756,11 +845,8 @@ namespace {
 
             log() << "replSet replSetInitiate all members seem up" << rsLog;
 
-            createOplog(txn);
-
             Lock::GlobalWrite lk(txn->lockState());
-            BSONObj comment = BSON( "msg" << "initiating set");
-            newConfig->saveConfigLocally(txn, comment);
+            newConfig->saveConfigLocally(txn, BSONObj());
             log() << "replSet replSetInitiate config now saved locally.  "
                 "Should come online in about a minute." << rsLog;
             resultObj->append("info",
@@ -882,21 +968,6 @@ namespace {
         return Status::OK();
     }
 
-    Status LegacyReplicationCoordinator::processReplSetMaintenance(OperationContext* txn,
-                                                                   bool activate,
-                                                                   BSONObjBuilder* resultObj) {
-        if (!setMaintenanceMode(txn, activate)) {
-            if (theReplSet->isPrimary()) {
-                return Status(ErrorCodes::NotSecondary, "primaries can't modify maintenance mode");
-            }
-            else {
-                return Status(ErrorCodes::OperationFailed, "already out of maintenance mode");
-            }
-        }
-
-        return Status::OK();
-    }
-
     Status LegacyReplicationCoordinator::processReplSetSyncFrom(const HostAndPort& target,
                                                                 BSONObjBuilder* resultObj) {
         resultObj->append("syncFromRequested", target.toString());
@@ -936,7 +1007,10 @@ namespace {
         if (!member) {
             return Status(ErrorCodes::NodeNotFound,
                           str::stream() << "Node with replica set member ID " << memberID <<
-                                  " could not be found in replica set config during handshake");
+                                  " could not be found in replica set config while attempting to "
+                                  "associate it with RID " << handshake.getRid() <<
+                                  " in replication handshake. ReplSet config: " <<
+                                  theReplSet->getConfig().toString());
         }
 
         _ridMemberMap[handshake.getRid()] = member;
@@ -944,16 +1018,35 @@ namespace {
         return Status::OK();
     }
 
-    void LegacyReplicationCoordinator::waitUpToOneSecondForOptimeChange(const OpTime& ot) {
-        repl::waitUpToOneSecondForOptimeChange(ot);
-    }
-
     bool LegacyReplicationCoordinator::buildsIndexes() {
         return theReplSet->buildIndexes();
     }
 
-    vector<BSONObj> LegacyReplicationCoordinator::getHostsWrittenTo(const OpTime& op) {
-        return repl::getHostsWrittenTo(op);
+    vector<HostAndPort> LegacyReplicationCoordinator::getHostsWrittenTo(const OpTime& op) {
+        vector<BSONObj> configs = repl::getHostsWrittenTo(op);
+        vector<HostAndPort> hosts;
+        for (size_t i = 0; i < configs.size(); ++i) {
+            hosts.push_back(HostAndPort(configs[i]["host"].String()));
+        }
+        return hosts;
+    }
+
+    vector<HostAndPort> LegacyReplicationCoordinator::getOtherNodesInReplSet() const {
+        std::vector<HostAndPort> rsMembers;
+        const unsigned rsSelfId = theReplSet->selfId();
+        const std::vector<repl::ReplSetConfig::MemberCfg>& rsMemberConfigs =
+            repl::theReplSet->config().members;
+        for (size_t i = 0; i < rsMemberConfigs.size(); ++i) {
+            const unsigned otherId = rsMemberConfigs[i]._id;
+            if (rsSelfId == otherId)
+                continue;
+            const repl::Member* other = repl::theReplSet->findById(otherId);
+            if (!other) {
+                continue;
+            }
+            rsMembers.push_back(other->h());
+        }
+        return rsMembers;
     }
 
     Status LegacyReplicationCoordinator::checkIfWriteConcernCanBeSatisfied(
@@ -980,6 +1073,29 @@ namespace {
     bool LegacyReplicationCoordinator::isReplEnabled() const {
         return _settings.usingReplSets() || _settings.slave || _settings.master;
     }
+
+    HostAndPort LegacyReplicationCoordinator::chooseNewSyncSource() {
+        const Member* member = theReplSet->getMemberToSyncTo();
+        if (member) {
+            return member->h();
+        }
+        else {
+            return HostAndPort();
+        }
+    }
+
+    void LegacyReplicationCoordinator::blacklistSyncSource(const HostAndPort& host, Date_t until) {
+        theReplSet->veto(host.toString(), until);
+    }
+
+    void LegacyReplicationCoordinator::resetLastOpTimeFromOplog(OperationContext* txn) {
+        theReplSet->loadLastOpTimeWritten(txn, false);
+    }
+
+    bool LegacyReplicationCoordinator::shouldChangeSyncSource(const HostAndPort& currentSource) {
+        return theReplSet->shouldChangeSyncTarget(currentSource);
+    }
+    
 
 } // namespace repl
 } // namespace mongo

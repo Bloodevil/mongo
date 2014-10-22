@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/geo_near.h"
 
 // For s2 search
@@ -68,7 +70,7 @@ namespace mongo {
                     return NULL;
 
                 auto_ptr<StoredGeometry> stored(new StoredGeometry);
-                if (!stored->geometry.parseFrom(element.Obj()))
+                if (!stored->geometry.parseFromStorage(element).isOK())
                     return NULL;
                 stored->element = element;
                 return stored.release();
@@ -265,10 +267,14 @@ namespace mongo {
         return fullBounds;
     }
 
-    static double twoDBoundsIncrement(const GeoNearParams& nearParams) {
-        // TODO: Revisit and tune these
+    static double twoDBoundsIncrement(IndexDescriptor* twoDIndex, const GeoNearParams& nearParams) {
         if (FLAT == nearParams.nearQuery->centroid->crs) {
-            return 10;
+            GeoHashConverter::Parameters hashParams;
+            Status status = GeoHashConverter::parseParameters(twoDIndex->infoObj(), &hashParams);
+            invariant(status.isOK()); // The index status should always be valid
+
+            GeoHashConverter converter(hashParams);
+            return 5 * converter.sizeEdge(hashParams.bits);
         }
         else {
             return kMaxEarthDistanceInMeters / 1000.0;
@@ -291,7 +297,7 @@ namespace mongo {
           _twoDIndex(twoDIndex),
           _fullBounds(twoDDistanceBounds(nearParams, twoDIndex)),
           _currBounds(_fullBounds.center(), -1, _fullBounds.getInner()),
-          _boundsIncrement(twoDBoundsIncrement(nearParams)) {
+          _boundsIncrement(twoDBoundsIncrement(twoDIndex, nearParams)) {
 
         getNearStats()->keyPattern = twoDIndex->keyPattern();
     }
@@ -326,12 +332,8 @@ namespace mongo {
                 if (!e.isABSONObj())
                     return false;
 
-                if (!GeoParser::isIndexablePoint(e.Obj()))
-                    return false;
-
                 PointWithCRS point;
-                if (!GeoParser::parsePoint(e.Obj(), &point))
-                    return false;
+                if (!GeoParser::parseStoredPoint(e, &point).isOK()) return false;
 
                 return _annulus.contains(point.oldPoint);
             }
@@ -386,7 +388,7 @@ namespace mongo {
             virtual bool matchesSingleElement(const BSONElement& e) const {
                 // Something has gone terribly wrong if this doesn't hold.
                 invariant(BinData == e.type());
-                return !_region->fastDisjoint(_unhasher.unhashToBox(e));
+                return !_region->fastDisjoint(_unhasher.unhashToBoxCovering(_unhasher.hash(e)));
             }
 
             //

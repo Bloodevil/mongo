@@ -130,14 +130,18 @@ namespace mongo {
 
         BSONObj docFor(OperationContext* txn, const DiskLoc& loc) const;
 
+        /**
+         * @param out - contents set to the right docs if exists, or nothing.
+         * @return true iff loc exists
+         */
+        bool findDoc(OperationContext* txn, const DiskLoc& loc, BSONObj* out) const;
+
         // ---- things that should move to a CollectionAccessMethod like thing
         /**
-         * canonical to get all would be
-         * getIterator( DiskLoc(), false, CollectionScanParams::FORWARD )
+         * Default arguments will return all items in the collection.
          */
         RecordIterator* getIterator( OperationContext* txn,
                                      const DiskLoc& start = DiskLoc(),
-                                     bool tailable = false,
                                      const CollectionScanParams::Direction& dir = CollectionScanParams::FORWARD ) const;
 
         /**
@@ -197,6 +201,7 @@ namespace mongo {
          */
         Status updateDocumentWithDamages( OperationContext* txn,
                                           const DiskLoc& loc,
+                                          const RecordData& oldRec,
                                           const char* damangeSource,
                                           const mutablebson::DamageVector& damages );
 
@@ -256,6 +261,10 @@ namespace mongo {
                 return 5;
             return static_cast<int>( dataSize( txn ) / n );
         }
+
+        uint64_t getIndexSize(OperationContext* opCtx,
+                              BSONObjBuilder* details = NULL,
+                              int scale = 1);
 
         // --- end suspect things
 

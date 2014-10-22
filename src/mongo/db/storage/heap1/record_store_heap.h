@@ -57,6 +57,8 @@ namespace mongo {
 
         virtual RecordData dataFor( OperationContext* txn, const DiskLoc& loc ) const;
 
+        virtual bool findRecord( OperationContext* txn, const DiskLoc& loc, RecordData* rd ) const;
+
         virtual void deleteRecord( OperationContext* txn, const DiskLoc& dl );
 
         virtual StatusWith<DiskLoc> insertRecord( OperationContext* txn,
@@ -77,12 +79,12 @@ namespace mongo {
                                                   
         virtual Status updateWithDamages( OperationContext* txn,
                                           const DiskLoc& loc,
-                                          const char* damangeSource,
+                                          const RecordData& oldRec,
+                                          const char* damageSource,
                                           const mutablebson::DamageVector& damages );
 
         virtual RecordIterator* getIterator( OperationContext* txn,
                                              const DiskLoc& start,
-                                             bool tailable,
                                              const CollectionScanParams::Direction& dir) const;
 
         virtual RecordIterator* getIteratorForRepair( OperationContext* txn ) const;
@@ -193,7 +195,7 @@ namespace mongo {
 
         virtual void saveState();
 
-        virtual bool restoreState();
+        virtual bool restoreState(OperationContext* txn);
 
         virtual RecordData dataFor( const DiskLoc& loc ) const;
 
@@ -225,7 +227,7 @@ namespace mongo {
 
         virtual void saveState();
 
-        virtual bool restoreState();
+        virtual bool restoreState(OperationContext* txn);
 
         virtual RecordData dataFor( const DiskLoc& loc ) const;
 

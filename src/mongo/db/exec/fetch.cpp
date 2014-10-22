@@ -30,6 +30,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
@@ -119,6 +120,7 @@ namespace mongo {
     }
 
     void FetchStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
         _child->restoreState(opCtx);
     }

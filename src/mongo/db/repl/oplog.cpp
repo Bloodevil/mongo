@@ -42,20 +42,20 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/background.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/dbhash.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/global_optime.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/operation_context_impl.h"
@@ -119,14 +119,14 @@ namespace repl {
     /** write an op to the oplog that is already built.
         todo : make _logOpRS() call this so we don't repeat ourself?
         */
-    void _logOpObjRS(OperationContext* txn, const BSONObj& op) {
-        Lock::DBWrite lk(txn->lockState(), "local");
+    OpTime _logOpObjRS(OperationContext* txn, const BSONObj& op) {
+        Lock::DBLock lk(txn->lockState(), "local", MODE_X);
         // XXX soon this needs to be part of an outer WUOW not its own.
         // We can't do this yet due to locking limitations.
         WriteUnitOfWork wunit(txn);
 
         const OpTime ts = op["ts"]._opTime();
-        long long h = op["h"].numberLong();
+        long long hash = op["h"].numberLong();
 
         {
             if ( localOplogRSCollection == 0 ) {
@@ -142,34 +142,26 @@ namespace repl {
             Client::Context ctx(txn, rsoplog, localDB);
             checkOplogInsert(localOplogRSCollection->insertDocument(txn, op, false));
 
-            /* todo: now() has code to handle clock skew.  but if the skew server to server is large it will get unhappy.
-                     this code (or code in now() maybe) should be improved.
-                     */
-            if( theReplSet ) {
-                if( !(theReplSet->lastOpTimeWritten<ts) ) {
-                    log() << "replication oplog stream went back in time. previous timestamp: "
-                          << theReplSet->lastOpTimeWritten << " newest timestamp: " << ts
-                          << ". attempting to sync directly from primary." << endl;
-                    BSONObjBuilder result;
-                    Status status =
-                            theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
-                                                      &result);
-                    if (!status.isOK()) {
-                        log() << "Can't sync from primary: " << status;
-                    }
-                }
-                theReplSet->lastOpTimeWritten = ts;
-                theReplSet->lastH = h;
-                ctx.getClient()->setLastOp( ts );
-
-                ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-                replCoord->setMyLastOptime(txn, ts);
-                BackgroundSync::notify();
+            ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+            OpTime myLastOptime = replCoord->getMyLastOptime();
+            if (!(myLastOptime < ts)) {
+                severe() << "replication oplog stream went back in time. previous timestamp: "
+                         << myLastOptime << " newest timestamp: " << ts;
+                fassertFailedNoTrace(18905);
             }
+            
+            BackgroundSync* bgsync = BackgroundSync::get();
+            // Keep this up-to-date, in case we step up to primary.
+            bgsync->setLastAppliedHash(hash);
+
+            ctx.getClient()->setLastOp( ts );
+            
+            replCoord->setMyLastOptime(txn, ts);
         }
 
         setNewOptime(ts);
         wunit.commit();
+        return ts;
     }
 
     /**
@@ -236,7 +228,6 @@ namespace repl {
     // the compiler would use if inside the function.  the reason this is static is to avoid a malloc/free for this
     // on every logop call.
     static BufBuilder logopbufbuilder(8*1024);
-    static const int OPLOG_VERSION = 2;
     static void _logOpRS(OperationContext* txn,
                          const char *opstr,
                          const char *ns,
@@ -245,7 +236,7 @@ namespace repl {
                          BSONObj *o2,
                          bool *bb,
                          bool fromMigrate ) {
-        Lock::DBWrite lk1(txn->lockState(), "local");
+        Lock::DBLock lk1(txn->lockState(), "local", MODE_X);
         WriteUnitOfWork wunit(txn);
 
         if ( strncmp(ns, "local.", 6) == 0 ) {
@@ -253,25 +244,32 @@ namespace repl {
                 resetSlaveCache();
             return;
         }
+        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
 
         mutex::scoped_lock lk2(newOpMutex);
 
         OpTime ts(getNextGlobalOptime());
         newOptimeNotifier.notify_all();
 
-        long long hashNew;
-        if( theReplSet ) {
-            if (!theReplSet->box.getState().primary()) {
-                log() << "replSet error : logOp() but not primary";
-                fassertFailed(17405);
-            }
-            hashNew = (theReplSet->lastH * 131 + ts.asLL()) * 17 + theReplSet->selfId();
+        long long hashNew = BackgroundSync::get()->getLastAppliedHash();
+
+        // Check to make sure logOp() is legal at this point.
+        if (*opstr == 'n') {
+            // 'n' operations are always logged
+            invariant(*ns == '\0');
+
+            // 'n' operations do not advance the hash, since they are not rolled back
         }
         else {
-            // must be initiation
-            verify( *ns == 0 );
-            hashNew = 0;
+            if (!replCoord->canAcceptWritesForDatabase(nsToDatabaseSubstring(ns))) {
+                severe() << "replSet error : logOp() but can't accept write to collection " << ns;
+                fassertFailed(17405);
+            }
+
+            // Advance the hash
+            hashNew = (hashNew * 131 + ts.asLL()) * 17 + replCoord->getMyId();
         }
+
 
         /* we jump through a bunch of hoops here to avoid copying the obj buffer twice --
            instead we do a single copy to the destination position in the memory mapped file.
@@ -306,28 +304,10 @@ namespace repl {
         OplogDocWriter writer( partial, obj );
         checkOplogInsert( localOplogRSCollection->insertDocument( txn, &writer, false ) );
 
-        /* todo: now() has code to handle clock skew.  but if the skew server to server is large it will get unhappy.
-           this code (or code in now() maybe) should be improved.
-        */
-        if( theReplSet ) {
-            if( !(theReplSet->lastOpTimeWritten<ts) ) {
-                log() << "replication oplog stream went back in time. previous timestamp: "
-                      << theReplSet->lastOpTimeWritten << " newest timestamp: " << ts
-                      << ". attempting to sync directly from primary." << endl;
-                BSONObjBuilder result;
-                Status status = theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
-                                                          &result);
-                if (!status.isOK()) {
-                    log() << "Can't sync from primary: " << status;
-                }
-            }
-            theReplSet->lastOpTimeWritten = ts;
-            theReplSet->lastH = hashNew;
-            ctx.getClient()->setLastOp( ts );
+        BackgroundSync::get()->setLastAppliedHash(hashNew);
+        ctx.getClient()->setLastOp( ts );
+        replCoord->setMyLastOptime(txn, ts);
 
-            ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-            replCoord->setMyLastOptime(txn, ts);
-        }
         wunit.commit();
 
     }
@@ -340,7 +320,7 @@ namespace repl {
                           BSONObj *o2,
                           bool *bb,
                           bool fromMigrate ) {
-        Lock::DBWrite lk(txn->lockState(), "local");
+        Lock::DBLock lk(txn->lockState(), "local", MODE_X);
         WriteUnitOfWork wunit(txn);
         static BufBuilder bufbuilder(8*1024); // todo there is likely a mutex on this constructor
 
@@ -435,6 +415,16 @@ namespace repl {
                bool* b,
                bool fromMigrate) {
         try {
+            // TODO SERVER-15192 remove this once all listeners are rollback-safe.
+            class RollbackPreventer : public RecoveryUnit::Change {
+                virtual void commit() {}
+                virtual void rollback() {
+                    severe() << "Rollback of logOp not currently allowed (SERVER-15192)";
+                    fassertFailed(18805);
+                }
+            };
+            txn->recoveryUnit()->registerChange(new RollbackPreventer());
+
             if ( getGlobalReplicationCoordinator()->isReplEnabled() ) {
                 _logOp(txn, opstr, ns, 0, obj, patt, b, fromMigrate);
             }
@@ -463,6 +453,7 @@ namespace repl {
 
     void createOplog(OperationContext* txn) {
         Lock::GlobalWrite lk(txn->lockState());
+        WriteUnitOfWork uow( txn );
 
         const char * ns = "local.oplog.$main";
 
@@ -477,7 +468,10 @@ namespace repl {
         if ( collection ) {
 
             if (replSettings.oplogSize != 0) {
-                int o = (int)(collection->getRecordStore()->storageSize(txn) / ( 1024 * 1024 ) );
+                const CollectionOptions oplogOpts =
+                    collection->getCatalogEntry()->getCollectionOptions(txn);
+
+                int o = (int)(oplogOpts.cappedSize / ( 1024 * 1024 ) );
                 int n = (int)(replSettings.oplogSize / (1024 * 1024));
                 if ( n != o ) {
                     stringstream ss;
@@ -487,9 +481,9 @@ namespace repl {
                 }
             }
 
-            if( rs ) return;
-
-            initOpTimeFromOplog(txn, ns);
+            if ( !rs )
+                initOpTimeFromOplog(txn, ns);
+            uow.commit();
             return;
         }
 
@@ -528,11 +522,10 @@ namespace repl {
         options.cappedSize = sz;
         options.autoIndexId = CollectionOptions::NO;
 
-        WriteUnitOfWork wunit(txn);
         invariant(ctx.db()->createCollection(txn, ns, options));
         if( !rs )
             logOp(txn, "n", "", BSONObj() );
-        wunit.commit();
+        uow.commit();
 
         /* sync here so we don't get any surprising lag later when we try to sync */
         StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
@@ -743,7 +736,7 @@ namespace repl {
         else if ( *opType == 'd' ) {
             opCounters->gotDelete();
             if ( opType[1] == 0 )
-                deleteObjects(txn, db, ns, o, /*justOne*/ valueB);
+                deleteObjects(txn, db, ns, o, PlanExecutor::YIELD_MANUAL, /*justOne*/ valueB);
             else
                 verify( opType[1] == 'b' ); // "db" advertisement
         }

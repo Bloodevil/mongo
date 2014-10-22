@@ -28,56 +28,229 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/thread.hpp>
+#include <vector>
 
+#include "mongo/db/concurrency/lock_mgr_test_help.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/db/concurrency/lock_mgr.h"
-#include "mongo/db/concurrency/lock_state.h"
 
 
 namespace mongo {
-namespace newlm {
-
-    class TrackingLockGrantNotification : public LockGrantNotification {
-    public:
-        TrackingLockGrantNotification() : numNotifies(0), lastResult(LOCK_INVALID) {
-
-        }
-
-        virtual void notify(const ResourceId& resId, LockResult result) {
-            numNotifies++;
-            lastResId = resId;
-            lastResult = result;
-        }
-
-    public:
-        int numNotifies;
-
-        ResourceId lastResId;
-        LockResult lastResult;
-    };
-
     
-    TEST(Locker, BasicLockNoConflict) {
-        Locker locker(1);
-        TrackingLockGrantNotification notify;
-
+    TEST(LockerImpl, LockNoConflict) {
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        ASSERT(LOCK_OK == locker.lockExtended(resId, MODE_X, &notify));
+        LockerImpl<true> locker(1);
+        locker.lockGlobal(MODE_IX);
+
+        ASSERT(LOCK_OK == locker.lock(resId, MODE_X));
+
         ASSERT(locker.isLockHeldForMode(resId, MODE_X));
         ASSERT(locker.isLockHeldForMode(resId, MODE_S));
 
-        locker.unlock(resId);
+        ASSERT(locker.unlock(resId));
 
-        ASSERT(!locker.isLockHeldForMode(resId, MODE_NONE));
+        ASSERT(locker.isLockHeldForMode(resId, MODE_NONE));
+
+        locker.unlockAll();
     }
 
-    // Randomly acquires and releases locks, just to make sure that no assertions pop-up
-    TEST(Locker, RandomizedAcquireRelease) {
-        // TODO: Make sure to print the seed
+    TEST(LockerImpl, ReLockNoConflict) {
+        const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        LockerImpl<true> locker(1);
+        locker.lockGlobal(MODE_IX);
+
+        ASSERT(LOCK_OK == locker.lock(resId, MODE_S));
+        ASSERT(LOCK_OK == locker.lock(resId, MODE_X));
+
+        ASSERT(!locker.unlock(resId));
+        ASSERT(locker.isLockHeldForMode(resId, MODE_X));
+
+        ASSERT(locker.unlock(resId));
+        ASSERT(locker.isLockHeldForMode(resId, MODE_NONE));
+
+        ASSERT(locker.unlockAll());
     }
 
-} // namespace newlm
+    TEST(LockerImpl, ConflictWithTimeout) {
+        const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        LockerImpl<true> locker1(1);
+        ASSERT(LOCK_OK == locker1.lockGlobal(MODE_IX));
+        ASSERT(LOCK_OK == locker1.lock(resId, MODE_X));
+
+        LockerImpl<true> locker2(2);
+        ASSERT(LOCK_OK == locker2.lockGlobal(MODE_IX));
+        ASSERT(LOCK_TIMEOUT == locker2.lock(resId, MODE_S, 0));
+
+        ASSERT(locker2.isLockHeldForMode(resId, MODE_NONE));
+
+        ASSERT(locker1.unlock(resId));
+
+        ASSERT(locker1.unlockAll());
+        ASSERT(locker2.unlockAll());
+    }
+
+    TEST(LockerImpl, ConflictUpgradeWithTimeout) {
+        const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        LockerImpl<true> locker1(1);
+        ASSERT(LOCK_OK == locker1.lockGlobal(MODE_IS));
+        ASSERT(LOCK_OK == locker1.lock(resId, MODE_S));
+
+        LockerImpl<true> locker2(2);
+        ASSERT(LOCK_OK == locker2.lockGlobal(MODE_IS));
+        ASSERT(LOCK_OK == locker2.lock(resId, MODE_S));
+
+        // Try upgrading locker 1, which should block and timeout
+        ASSERT(LOCK_TIMEOUT == locker1.lock(resId, MODE_X, 1));
+
+        locker1.unlockAll();
+        locker2.unlockAll();
+    }
+
+    TEST(LockerImpl, ReadTransaction) {
+        LockerImpl<true> locker(1);
+
+        locker.lockGlobal(MODE_IS);
+        locker.unlockAll();
+
+        locker.lockGlobal(MODE_IX);
+        locker.unlockAll();
+
+        locker.lockGlobal(MODE_IX);
+        locker.lockGlobal(MODE_IS);
+        locker.unlockAll();
+        locker.unlockAll();
+    }
+
+    TEST(LockerImpl, WriteTransactionWithCommit) {
+        const ResourceId resIdCollection(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+        const ResourceId resIdRecordS(RESOURCE_DOCUMENT, 1);
+        const ResourceId resIdRecordX(RESOURCE_DOCUMENT, 2);
+
+        LockerImpl<true> locker(1);
+
+        locker.lockGlobal(MODE_IX);
+        {
+            ASSERT(LOCK_OK == locker.lock(resIdCollection, MODE_IX, 0));
+
+            locker.beginWriteUnitOfWork();
+
+            ASSERT(LOCK_OK == locker.lock(resIdRecordS, MODE_S, 0));
+            ASSERT(locker.getLockMode(resIdRecordS) == MODE_S);
+
+            ASSERT(LOCK_OK == locker.lock(resIdRecordX, MODE_X, 0));
+            ASSERT(locker.getLockMode(resIdRecordX) == MODE_X);
+
+            ASSERT(locker.unlock(resIdRecordS));
+            ASSERT(locker.getLockMode(resIdRecordS) == MODE_NONE);
+
+            ASSERT(!locker.unlock(resIdRecordX));
+            ASSERT(locker.getLockMode(resIdRecordX) == MODE_X);
+
+            locker.endWriteUnitOfWork();
+
+            {
+                AutoYieldFlushLockForMMAPV1Commit flushLockYield(&locker);
+
+                // This block simulates the flush/remap thread
+                {
+                    LockerImpl<true> flushLocker(2);
+                    AutoAcquireFlushLockForMMAPV1Commit flushLockAcquire(&flushLocker);
+                }
+            }
+
+            ASSERT(locker.getLockMode(resIdRecordX) == MODE_NONE);
+
+            ASSERT(locker.unlock(resIdCollection));
+        }
+        locker.unlockAll();
+    }
+
+    /**
+     * Test that saveLockerImpl<true> works by examining the output.
+     */
+    TEST(LockerImpl, saveAndRestoreGlobal) {
+        Locker::LockSnapshot lockInfo;
+
+        LockerImpl<true> locker(1);
+
+        // No lock requests made, no locks held.
+        locker.saveLockStateAndUnlock(&lockInfo);
+        ASSERT_EQUALS(0U, lockInfo.locks.size());
+
+        // Lock the global lock, but just once.
+        locker.lockGlobal(MODE_IX);
+
+        // We've locked the global lock.  This should be reflected in the lockInfo.
+        locker.saveLockStateAndUnlock(&lockInfo);
+        ASSERT(!locker.isLocked());
+        ASSERT_EQUALS(MODE_IX, lockInfo.globalMode);
+        ASSERT_EQUALS(1U, lockInfo.globalRecursiveCount);
+
+        // Restore the lock(s) we had.
+        locker.restoreLockState(lockInfo);
+
+        ASSERT(locker.isLocked());
+        ASSERT(locker.unlockAll());
+    }
+
+    /**
+     * Test that we don't unlock when we have the global lock more than once.
+     */
+    TEST(LockerImpl, saveAndRestoreGlobalAcquiredTwice) {
+        Locker::LockSnapshot lockInfo;
+
+        LockerImpl<true> locker(1);
+
+        // No lock requests made, no locks held.
+        locker.saveLockStateAndUnlock(&lockInfo);
+        ASSERT_EQUALS(0U, lockInfo.locks.size());
+
+        // Lock the global lock.
+        locker.lockGlobal(MODE_IX);
+        locker.lockGlobal(MODE_IX);
+
+        // This shouldn't actually unlock as we're in a nested scope.
+        ASSERT(!locker.saveLockStateAndUnlock(&lockInfo));
+
+        ASSERT(locker.isLocked());
+
+        // We must unlockAll twice.
+        ASSERT(!locker.unlockAll());
+        ASSERT(locker.unlockAll());
+    }
+
+    /**
+     * Tests that restoreLockerImpl<true> works by locking a db and collection and saving + restoring.
+     */
+    TEST(LockerImpl, saveAndRestoreDBAndCollection) {
+        Locker::LockSnapshot lockInfo;
+
+        LockerImpl<true> locker(1);
+
+        const ResourceId resIdDatabase(RESOURCE_DATABASE, std::string("TestDB"));
+        const ResourceId resIdCollection(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+
+        // Lock some stuff.
+        locker.lockGlobal(MODE_IX);
+        ASSERT(LOCK_OK == locker.lock(resIdDatabase, MODE_IX));
+        ASSERT(LOCK_OK == locker.lock(resIdCollection, MODE_X));
+        locker.saveLockStateAndUnlock(&lockInfo);
+
+        // Things shouldn't be locked anymore.
+        ASSERT(locker.getLockMode(resIdDatabase) == MODE_NONE);
+        ASSERT(locker.getLockMode(resIdCollection) == MODE_NONE);
+
+        // Restore lock state.
+        locker.restoreLockState(lockInfo);
+
+        // Make sure things were re-locked.
+        ASSERT(locker.getLockMode(resIdDatabase) == MODE_IX);
+        ASSERT(locker.getLockMode(resIdCollection) == MODE_X);
+
+        locker.unlockAll();
+    }
+
 } // namespace mongo

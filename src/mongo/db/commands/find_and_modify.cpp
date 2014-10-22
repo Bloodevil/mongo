@@ -34,10 +34,11 @@
 
 #include "mongo/db/commands/find_and_modify.h"
 
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/projection.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
@@ -68,7 +69,7 @@ namespace mongo {
             find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
         }
         /* this will eventually replace run,  once sort is handled */
-        bool runNoDirectClient( OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+        bool runNoDirectClient( OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             verify( cmdObj["sort"].eoo() );
 
             const string ns = dbname + '.' + cmdObj.firstElement().valuestr();
@@ -96,13 +97,36 @@ namespace mongo {
                 return false;
             }
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
-            Client::Context ctx(txn, ns);
-            
-            return runNoDirectClient( txn, ns , 
-                                      query , fields , update , 
-                                      upsert , returnNew , remove , 
-                                      result , errmsg );
+            bool ok = runNoDirectClient( txn, ns,
+                                         query, fields, update,
+                                         upsert, returnNew, remove,
+                                         result, errmsg );
+
+            if ( !ok && errmsg == "no-collection" ) {
+                {
+                    Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
+                    Client::Context ctx(txn, ns, false /* don't check version */);
+                    Database* db = ctx.db();
+                    if ( db->getCollection( txn, ns ) ) {
+                        // someone else beat us to it, that's ok
+                        // we might race while we unlock if someone drops
+                        // but that's ok, we'll just do nothing and error out
+                    }
+                    else {
+                        WriteUnitOfWork wuow(txn);
+                        uassertStatusOK( userCreateNS( txn, db,
+                                                       ns, BSONObj(),
+                                                       !fromRepl ) );
+                        wuow.commit();
+                    }
+                }
+                errmsg = "";
+                ok = runNoDirectClient( txn, ns,
+                                        query, fields, update,
+                                        upsert, returnNew, remove,
+                                        result, errmsg );
+            }
+            return ok;
         }
 
         static void _appendHelper(BSONObjBuilder& result,
@@ -136,13 +160,25 @@ namespace mongo {
                                       BSONObjBuilder& result,
                                       string& errmsg) {
 
-            Lock::DBWrite lk(txn->lockState(), ns);
-            WriteUnitOfWork wunit(txn);
-            Client::Context cx(txn, ns);
-            
-            Collection* collection = cx.db()->getCollection( txn, ns );
+            Client::WriteContext cx(txn, ns);
+            Collection* collection = cx.getCollection();
 
             const WhereCallbackReal whereCallback = WhereCallbackReal(txn, StringData(ns));
+
+            if ( !collection ) {
+                if ( !upsert ) {
+                    // no collectio and no upsert, so can't possible do anything
+                    _appendHelper( result, BSONObj(), false, fields, whereCallback );
+                    return true;
+                }
+                // no collection, but upsert, so we want to create it
+                // problem is we only have IX on db and collection :(
+                // so we tell our caller who can do it
+                errmsg = "no-collection";
+                return false;
+            }
+
+
 
             BSONObj doc;
             bool found = false;
@@ -153,19 +189,22 @@ namespace mongo {
 
                 PlanExecutor* rawExec;
                 massert(17384, "Could not get plan executor for query " + queryOriginal.toString(),
-                        getExecutor(txn, collection, cq, &rawExec, QueryPlannerParams::DEFAULT).isOK());
+                        getExecutor(txn,
+                                    collection,
+                                    cq,
+                                    PlanExecutor::YIELD_AUTO,
+                                    &rawExec,
+                                    QueryPlannerParams::DEFAULT).isOK());
 
-                auto_ptr<PlanExecutor> exec(rawExec);
-
-                // We need to keep this PlanExecutor registration: we are concurrently modifying
-                // state and may continue doing that with document-level locking (approach is TBD).
-                const ScopedExecutorRegistration safety(exec.get());
+                scoped_ptr<PlanExecutor> exec(rawExec);
 
                 PlanExecutor::ExecState state;
                 if (PlanExecutor::ADVANCED == (state = exec->getNext(&doc, NULL))) {
                     found = true;
                 }
             }
+
+            WriteUnitOfWork wuow(txn);
 
             BSONObj queryModified = queryOriginal;
             if ( found && doc["_id"].type() && ! CanonicalQuery::isSimpleIdQuery( queryOriginal ) ) {
@@ -228,7 +267,8 @@ namespace mongo {
             if ( remove ) {
                 _appendHelper(result, doc, found, fields, whereCallback);
                 if ( found ) {
-                    deleteObjects(txn, cx.db(), ns, queryModified, true, true);
+                    deleteObjects(txn, cx.db(), ns, queryModified, PlanExecutor::YIELD_AUTO,
+                                  true, true);
                     BSONObjBuilder le( result.subobjStart( "lastErrorObject" ) );
                     le.appendNumber( "n" , 1 );
                     le.done();
@@ -254,6 +294,9 @@ namespace mongo {
                     request.setUpdates(update);
                     request.setUpsert(upsert);
                     request.setUpdateOpLog();
+
+                    request.setYieldPolicy(PlanExecutor::YIELD_AUTO);
+
                     // TODO(greg) We need to send if we are ignoring
                     // the shard version below, but for now no
                     UpdateLifecycleImpl updateLifecycle(false, requestNs);
@@ -264,7 +307,7 @@ namespace mongo {
 
                     if ( !collection ) {
                         // collection created by an upsert
-                        collection = cx.db()->getCollection( txn, ns );
+                        collection = cx.getCollection();
                     }
 
                     LOG(3) << "update result: "  << res ;
@@ -302,7 +345,7 @@ namespace mongo {
                     
                 }
             }
-            wunit.commit();
+            wuow.commit();
             return true;
         }
         
@@ -334,7 +377,7 @@ namespace mongo {
                 }
             }
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
             WriteUnitOfWork wunit(txn);
             Client::Context ctx(txn, ns);
 

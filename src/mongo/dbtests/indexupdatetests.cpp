@@ -28,14 +28,15 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_environment_d.h"
 #include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/index/btree_based_bulk_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/platform/cstdint.h"
 
@@ -54,17 +55,18 @@ namespace IndexUpdateTests {
     public:
         IndexBuildBase() :
             _ctx(&_txn, _ns),
+            _wunit(&_txn),
             _client(&_txn) {
 
             _client.createCollection( _ns );
         }
         ~IndexBuildBase() {
             _client.dropCollection( _ns );
-            _ctx.commit(); // just for testing purposes
+            _wunit.commit(); // just for testing purposes
             getGlobalEnvironment()->unsetKillAllOperations();
         }
         Collection* collection() {
-            return _ctx.ctx().db()->getCollection( &_txn, _ns );
+            return _ctx.getCollection();
         }
     protected:
     // QUERY_MIGRATION
@@ -116,6 +118,7 @@ namespace IndexUpdateTests {
 
         OperationContextImpl _txn;
         Client::WriteContext _ctx;
+        WriteUnitOfWork _wunit;
         DBDirectClient _client;
     };
 
@@ -569,6 +572,8 @@ namespace IndexUpdateTests {
             for( int32_t i = 0; i < nDocs; ++i ) {
                 _client.insert( _ns, BSON( "a" << i ) );
             }
+            // Start with just _id
+            ASSERT_EQUALS( 1U, _client.getIndexSpecs(_ns).size());
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.  killAll() rather than kill() is required because the direct
@@ -578,10 +583,8 @@ namespace IndexUpdateTests {
             _client.ensureIndex( _ns, BSON( "a" << 1 ) );
             // only want to interrupt the index build
             getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in system.indexes because the index build completed.
-            ASSERT_EQUALS( 1U,
-                           _client.count( "unittests.system.indexes",
-                                          BSON( "ns" << _ns << "name" << "a_1" ) ) );
+            // The new index is listed in getIndexSpecs because the index build completed.
+            ASSERT_EQUALS( 2U, _client.getIndexSpecs(_ns).size());
         }
     };
 
@@ -595,6 +598,8 @@ namespace IndexUpdateTests {
             for( int32_t i = 0; i < nDocs; ++i ) {
                 _client.insert( _ns, BSON( "a" << i ) );
             }
+            // Start with just _id
+            ASSERT_EQUALS( 1U, _client.getIndexSpecs(_ns).size());
             // Initialize curop.
             _txn.getCurOp()->reset();
             // Request an interrupt.
@@ -604,10 +609,8 @@ namespace IndexUpdateTests {
             // only want to interrupt the index build
             wunit.commit();
             getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in system.indexes because the index build completed.
-            ASSERT_EQUALS( 1U,
-                           _client.count( "unittests.system.indexes",
-                                          BSON( "ns" << _ns << "name" << "a_1" ) ) );
+            // The new index is listed in getIndexSpecs because the index build completed.
+            ASSERT_EQUALS( 2U, _client.getIndexSpecs(_ns).size());
         }
     };
     // QUERY_MIGRATION
@@ -662,7 +665,9 @@ namespace IndexUpdateTests {
             memcpy( infoRecord->data(), indexInfo.objdata(), indexInfo.objsize() );
             addRecordToRecListInExtent( infoRecord, infoLoc );
 
-            return new IndexCatalog::IndexBuildBlock( _ctx.ctx().db()->getCollection( _ns )->getIndexCatalog(), name, infoLoc );
+            return new IndexCatalog::IndexBuildBlock( _ctx.getCollection()->getIndexCatalog(),
+                                                     name,
+                                                     infoLoc );
         }
     };
 #endif

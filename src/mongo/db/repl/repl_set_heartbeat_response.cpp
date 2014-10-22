@@ -37,12 +37,16 @@
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 namespace repl {
 namespace {
 
+    const std::string kOkFieldName = "ok";
+    const std::string kErrMsgFieldName = "errmsg";
+    const std::string kErrorCodeFieldName = "code";
     const std::string kOpTimeFieldName = "opTime";
     const std::string kTimeFieldName = "time";
     const std::string kElectionTimeFieldName = "electionTime";
@@ -56,6 +60,7 @@ namespace {
     const std::string kHbMessageFieldName = "hbmsg";
     const std::string kReplSetFieldName = "set";
     const std::string kSyncSourceFieldName = "syncingTo";
+    const std::string kHasDataFieldName = "hasData";
 
 }  // namespace
 
@@ -66,6 +71,8 @@ namespace {
             _opTimeSet(false),
             _electableSet(false),
             _electable(false),
+            _hasDataSet(false),
+            _hasData(false),
             _mismatch(false),
             _isReplSet(false),
             _stateDisagreement(false),
@@ -75,6 +82,13 @@ namespace {
             {}
 
     void ReplSetHeartbeatResponse::addToBSON(BSONObjBuilder* builder) const {
+        if (_mismatch) {
+            *builder << kOkFieldName << 0.0;
+            *builder << kMismatchFieldName << _mismatch;
+            return;
+        }
+
+        builder->append(kOkFieldName, 1.0);
         if (_opTimeSet) {
             builder->appendDate(kOpTimeFieldName, _opTime.asDate());
         }
@@ -89,9 +103,6 @@ namespace {
         }
         if (_electableSet) {
             *builder << kIsElectableFieldName << _electable;
-        }
-        if (_mismatch) {
-            *builder << kMismatchFieldName << _mismatch;
         }
         if (_isReplSet) {
             *builder << "rs" << _isReplSet;
@@ -112,6 +123,9 @@ namespace {
         if (!_syncingTo.empty()) {
             *builder << kSyncSourceFieldName << _syncingTo;
         }
+        if (_hasDataSet) {
+            builder->append(kHasDataFieldName, _hasData);
+        }
     }
 
     BSONObj ReplSetHeartbeatResponse::toBSON() const {
@@ -121,6 +135,45 @@ namespace {
     }
 
     Status ReplSetHeartbeatResponse::initialize(const BSONObj& doc) {
+
+        // Old versions set this even though they returned not "ok"
+        _mismatch = doc[kMismatchFieldName].trueValue();
+        if (_mismatch)
+            return Status(ErrorCodes::InconsistentReplicaSetNames,
+                          "replica set name doesn't match.");
+
+        // Old versions sometimes set the replica set name ("set") but ok:0
+        const BSONElement replSetNameElement = doc[kReplSetFieldName];
+        if (replSetNameElement.eoo()) {
+            _setName.clear();
+        }
+        else if (replSetNameElement.type() != String) {
+            return Status(ErrorCodes::TypeMismatch, str::stream() << "Expected \"" <<
+                          kReplSetFieldName << "\" field in response to replSetHeartbeat to have "
+                          "type String, but found " << typeName(replSetNameElement.type()));
+        }
+        else {
+            _setName = replSetNameElement.String();
+        }
+
+        if (_setName.empty()  && !doc[kOkFieldName].trueValue()) {
+            std::string errMsg = doc[kErrMsgFieldName].str();
+
+            BSONElement errCodeElem = doc[kErrorCodeFieldName];
+            if (errCodeElem.ok()) {
+                if (!errCodeElem.isNumber())
+                    return Status(ErrorCodes::BadValue, "Error code is not a number!");
+
+                int errorCode = errCodeElem.numberInt();
+                return Status(ErrorCodes::Error(errorCode), errMsg);
+            }
+            return Status(ErrorCodes::UnknownError, errMsg);
+        }
+
+        const BSONElement hasDataElement = doc[kHasDataFieldName];
+        _hasDataSet = !hasDataElement.eoo();
+        _hasData = hasDataElement.trueValue();
+
         const BSONElement electionTimeElement = doc[kElectionTimeFieldName];
         if (electionTimeElement.eoo()) {
             _electionTimeSet = false;
@@ -130,7 +183,7 @@ namespace {
             _electionTime = electionTimeElement._opTime();
         }
         else if (electionTimeElement.type() == Date) {
-            _electionTime = true;
+            _electionTimeSet = true;
             _electionTime = OpTime(electionTimeElement.date());
         }
         else {
@@ -150,7 +203,7 @@ namespace {
         }
         else {
             return Status(ErrorCodes::TypeMismatch, str::stream() << "Expected \"" <<
-                          kTimeFieldName << "\" field in reponse to replSetHeartbeat "
+                          kTimeFieldName << "\" field in response to replSetHeartbeat "
                           "command to have a numeric type, but found type " <<
                           typeName(timeElement.type()));
         }
@@ -183,7 +236,6 @@ namespace {
             _electable = electableElement.trueValue();
         }
 
-        _mismatch = doc[kMismatchFieldName].trueValue();
         _isReplSet = doc[kIsReplSetFieldName].trueValue();
 
         const BSONElement memberStateElement = doc[kMemberStateFieldName];
@@ -194,7 +246,7 @@ namespace {
                  memberStateElement.type() != NumberLong) {
             return Status(ErrorCodes::TypeMismatch, str::stream() << "Expected \"" <<
                           kMemberStateFieldName << "\" field in response to replSetHeartbeat "
-                          " command to have type NumberInt or NumberLong, but found type " <<
+                          "command to have type NumberInt or NumberLong, but found type " <<
                           typeName(memberStateElement.type()));
         }
         else {
@@ -202,40 +254,34 @@ namespace {
             if (stateInt < 0 || stateInt > MemberState::RS_MAX) {
                 return Status(ErrorCodes::BadValue, str::stream() << "Value for \"" <<
                               kMemberStateFieldName << "\" in response to replSetHeartbeat is "
-                              " out of range; legal values are non-negative and no more than " <<
+                              "out of range; legal values are non-negative and no more than " <<
                               MemberState::RS_MAX);
             }
+            _stateSet = true;
             _state = MemberState(static_cast<int>(stateInt));
         }
 
         _stateDisagreement = doc[kHasStateDisagreementFieldName].trueValue();
 
+
+        // Not required for the case of uninitialized members -- they have no config
         const BSONElement versionElement = doc[kConfigVersionFieldName];
-        if (versionElement.eoo()) {
+
+        // If we have an optime then we must have a version
+        if (_opTimeSet && versionElement.eoo()) {
             return Status(ErrorCodes::NoSuchKey, str::stream() <<
                           "Response to replSetHeartbeat missing required \"" <<
-                          kConfigVersionFieldName << " field");
+                          kConfigVersionFieldName << "\" field even though initialized");
         }
-        if (versionElement.type() != NumberInt) {
+
+        // If there is a "v" (config version) then it must be an int.
+        if (!versionElement.eoo() && versionElement.type() != NumberInt) {
             return Status(ErrorCodes::TypeMismatch, str::stream() << "Expected \"" <<
                           kConfigVersionFieldName <<
                           "\" field in response to replSetHeartbeat to have "
                           "type NumberInt, but found " << typeName(versionElement.type()));
         }
         _version = versionElement.numberInt();
-
-        const BSONElement replSetNameElement = doc[kReplSetFieldName];
-        if (replSetNameElement.eoo()) {
-            return Status(ErrorCodes::NoSuchKey, str::stream() <<
-                          "Response to replSetHeartbeat missing required \"" <<
-                          kReplSetFieldName << "\" field");
-        }
-        if (replSetNameElement.type() != String) {
-            return Status(ErrorCodes::TypeMismatch, str::stream() << "Expected \"" <<
-                          kReplSetFieldName << "\" field in response to replSetHeartbeat to have "
-                          "type String, but found " << typeName(replSetNameElement.type()));
-        }
-        _setName = replSetNameElement.String();
 
         const BSONElement hbMsgElement = doc[kHbMessageFieldName];
         if (hbMsgElement.eoo()) {
@@ -246,7 +292,9 @@ namespace {
                           kHbMessageFieldName << "\" field in response to replSetHeartbeat to have "
                           "type String, but found " << typeName(hbMsgElement.type()));
         }
-        _hbmsg = hbMsgElement.String();
+        else {
+            _hbmsg = hbMsgElement.String();
+        }
 
         const BSONElement syncingToElement = doc[kSyncSourceFieldName];
         if (syncingToElement.eoo()) {
@@ -257,12 +305,15 @@ namespace {
                           kSyncSourceFieldName << "\" field in response to replSetHeartbeat to "
                           "have type String, but found " << typeName(syncingToElement.type()));
         }
-        _syncingTo = syncingToElement.String();
+        else {
+            _syncingTo = syncingToElement.String();
+        }
 
         const BSONElement rsConfigElement = doc[kConfigFieldName];
         if (rsConfigElement.eoo()) {
             _configSet = false;
             _config = ReplicaSetConfig();
+            return Status::OK();
         }
         else if (rsConfigElement.type() != Object) {
             return Status(ErrorCodes::TypeMismatch, str::stream() << "Expected \"" <<

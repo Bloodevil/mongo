@@ -47,7 +47,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 
@@ -116,7 +115,7 @@ namespace mongo {
 
             set<string> clonedColls;
 
-            Lock::DBWrite dbXLock(txn->lockState(), dbname);
+            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
 
             Cloner cloner;
             bool rval = cloner.go(txn, dbname, from, opts, &clonedColls, errmsg);

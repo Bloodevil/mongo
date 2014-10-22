@@ -32,6 +32,7 @@
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/exec/projection.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/s/d_state.h"
@@ -135,6 +136,7 @@ namespace mongo {
     }
 
     void IDHackStage::restoreState(OperationContext* opCtx) {
+        _txn = opCtx;
         ++_commonStats.unyields;
     }
 
@@ -148,7 +150,7 @@ namespace mongo {
             && query.getParsed().getHint().isEmpty()
             && 0 == query.getParsed().getSkip()
             && CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter())
-            && !query.getParsed().hasOption(QueryOption_CursorTailable);
+            && !query.getParsed().getOptions().tailable;
     }
 
     vector<PlanStage*> IDHackStage::getChildren() const {
