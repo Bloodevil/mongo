@@ -114,6 +114,7 @@
 #include <fcntl.h>
 #include "linenoise.h"
 #include "linenoise_utf8.h"
+#include "mongo/shell/shell_options.h"
 #include "mk_wcwidth.h"
 #include <string>
 #include <vector>
@@ -139,7 +140,6 @@ struct linenoiseCompletions {
     vector<Utf32String> completionStrings;
 };
 
-#define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE 4096
 
 // make control-characters more readable
@@ -471,7 +471,7 @@ static KillRing killRing;
 
 static int rawmode = 0; /* for atexit() function to check if restore is needed*/
 static int atexit_registered = 0; /* register atexit just 1 time */
-static int historyMaxLen = LINENOISE_DEFAULT_HISTORY_MAX_LEN;
+static int historyMaxLen = mongo::shellGlobalParams.historyMaxLen;
 static int historyLen = 0;
 static int historyIndex = 0;
 static UChar8** history = NULL;

@@ -64,6 +64,8 @@ namespace mongo {
 
         options->addOptionChaining("eval", "eval", moe::String, "evaluate javascript");
 
+        options->addOptionChaining("historyMaxLen", "historyMaxLen", moe::Int, "shell history max length");
+
         moe::OptionSection authenticationOptions("Authentication Options");
 
         authenticationOptions.addOptionChaining("username", "username,u", moe::String,
@@ -194,6 +196,10 @@ namespace mongo {
 
         if (params.count("eval")) {
             shellGlobalParams.script = params["eval"].as<string>();
+        }
+
+        if (params.count("historyMaxLen")) {
+            shellGlobalParams.historyMaxLen = params["historyMaxLen"].as<int>();
         }
 
         if (params.count("username")) {

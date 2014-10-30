@@ -48,6 +48,8 @@ namespace mongo {
         std::string port;
         std::vector<std::string> files;
 
+        int historyMaxLen;
+
         std::string username;
         std::string password;
         bool usingPassword;
